@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="ms">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Sistem Jadual Guru Ganti</title>
+
+  <!-- PWA Manifest -->
+  <link rel="manifest" href="/gg/manifest.json" />
+
+  <!-- Theme & Status Bar -->
+  <meta name="theme-color" content="#1a3580" />
+  <meta name="msapplication-navbutton-color" content="#1a3580" />
+
+  <!-- iOS PWA Support -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Guru Ganti" />
+  <link rel="apple-touch-icon" href="/gg/icon-192.png" />
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" sizes="192x192" href="/gg/icon-192.png" />
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #1a3580;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      overflow: hidden;
+      font-family: sans-serif;
+    }
+
+    #splash {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      color: white;
+    }
+
+    #splash img {
+      width: 100px;
+      border-radius: 20px;
+      animation: pop 0.4s ease;
+    }
+
+    #splash p {
+      font-size: 14px;
+      opacity: 0.8;
+      letter-spacing: 0.5px;
+    }
+
+    @keyframes pop {
+      0%   { transform: scale(0.7); opacity: 0; }
+      100% { transform: scale(1);   opacity: 1; }
+    }
+
+    iframe {
+      display: none;
+      border: none;
+      width: 100vw;
+      height: 100vh;
+      position: fixed;
+      top: 0; left: 0;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Splash Screen -->
+  <div id="splash">
+    <img src="/gg/icon-192.png" alt="Logo" />
+    <p>Memuatkan...</p>
+  </div>
+
+  <!-- App iframe -->
+  <iframe
+    id="app-frame"
+    src="https://script.google.com/macros/s/AKfycbzJdUICFNhUcMpZbCe009iOwnUovJ8hbmvi40PH0lpfV1LD8ge7lMGgcdDfFP-B-P8u/exec"
+    allow="fullscreen"
+    title="Sistem Jadual Guru Ganti"
+  ></iframe>
+
+  <script>
+    // Register Service Worker
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/gg/sw.js', { scope: '/gg/' })
+        .then(reg => console.log('SW registered:', reg.scope))
+        .catch(err => console.warn('SW error:', err));
+    }
+
+    // Hide splash once iframe loads
+    const frame = document.getElementById('app-frame');
+    const splash = document.getElementById('splash');
+
+    frame.addEventListener('load', () => {
+      splash.style.display = 'none';
+      frame.style.display = 'block';
+    });
+
+    // Fallback: hide splash after 5s even if iframe is slow
+    setTimeout(() => {
+      splash.style.display = 'none';
+      frame.style.display = 'block';
+    }, 5000);
+  </script>
+
+</body>
+</html>
