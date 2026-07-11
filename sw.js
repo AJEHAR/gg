@@ -1,12 +1,12 @@
-const CACHE_NAME = 'guru-ganti-v1';
+const CACHE_NAME = 'guru-ganti-v2'; // v2 — naik versi ekoran migrasi domain (gg.syazr.com, laluan root)
 
 // Static assets to cache
 const STATIC_ASSETS = [
-  '/gg/',
-  '/gg/index.html',
-  '/gg/manifest.json',
-  '/gg/icon-192.png',
-  '/gg/icon-512.png'
+  '/',
+  '/index.html',
+  '/manifest.json',
+  '/icon-192.png',
+  '/icon-512.png'
 ];
 
 // Domains to NEVER cache (live data)
@@ -54,11 +54,11 @@ self.addEventListener('fetch', event => {
     caches.match(event.request).then(cached => {
       if (cached) return cached;
       return fetch(event.request).then(response => {
-        // Only cache valid GET responses within our scope
+        // Only cache valid GET responses dari origin sendiri (scope kini root "/")
         if (
           event.request.method === 'GET' &&
           response.status === 200 &&
-          url.pathname.startsWith('/gg/')
+          url.origin === self.location.origin
         ) {
           const clone = response.clone();
           caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));

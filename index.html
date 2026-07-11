@@ -4,6 +4,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
   <meta charset="UTF-8">
   <title>K-SpeEdS | SK Pendidikan Khas Kuantan</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#1a3580">
+  <link rel="icon" type="image/png" href="/icon-192.png">
+  <link rel="apple-touch-icon" href="/icon-192.png">
   <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
 
@@ -132,6 +136,9 @@
     .absent-add-row{display:flex;gap:8px;align-items:center;width:100%;}
     .absent-select{flex:1;min-width:0;height:48px;padding:0 12px;border:2px solid var(--border);border-radius:10px;font-size:var(--fs-sm);font-family:'Plus Jakarta Sans',sans-serif;color:var(--text);background:#fafbfe;outline:none;cursor:pointer;-webkit-appearance:none;appearance:none;}
     .absent-select:focus{border-color:var(--teal);}
+    .absent-reason-badge{display:inline-flex;align-items:center;flex-shrink:0;padding:2px 8px;border-radius:20px;font-size:.62rem;font-weight:800;cursor:pointer;white-space:nowrap;border:1.5px solid transparent;}
+    .reason-pick-btn{display:block;width:100%;text-align:left;padding:13px 14px;margin-bottom:8px;border-radius:10px;border:2px solid var(--border);background:#fafbfe;color:var(--text);font-weight:700;font-size:.9rem;cursor:pointer;font-family:'Plus Jakarta Sans',sans-serif;}
+    .reason-pick-btn:active{transform:scale(.98);}
     .btn-tambah{height:48px;padding:0 16px;background:linear-gradient(135deg,var(--danger),#b91c1c);color:white;border:none;border-radius:10px;font-size:var(--fs-sm);font-weight:800;cursor:pointer;display:flex;align-items:center;gap:7px;white-space:nowrap;flex-shrink:0;font-family:'Plus Jakarta Sans',sans-serif;-webkit-tap-highlight-color:transparent;transition:all .2s;}
     .btn-tambah:active{transform:scale(.96);}
 
@@ -438,6 +445,14 @@
           <select id="absent-select" class="absent-select">
             <option value="">— Pilih guru untuk tambah —</option>
           </select>
+        </div>
+        <div class="absent-add-row" style="margin-top:8px;">
+          <select id="absent-reason-select" class="absent-select">
+            <option value="">— Pilih sebab —</option>
+            <option value="Urusan Rasmi">Urusan Rasmi</option>
+            <option value="Cuti">Cuti</option>
+            <option value="Keluar Waktu Bekerja">Keluar Waktu Bekerja</option>
+          </select>
           <button onclick="addAbsent()" class="btn-tambah">
             <i class="fas fa-plus"></i> Tambah
           </button>
@@ -740,6 +755,19 @@
   </div>
 </div>
 
+<!-- Modal: Tukar Sebab Tidak Hadir -->
+<div id="reasonModal" class="modal-overlay hidden">
+  <div class="modal-box" style="max-height:60vh;">
+    <div class="modal-handle"></div>
+    <div class="modal-head">
+      <div class="modal-title"><i class="fas fa-comment-medical" style="color:var(--danger);"></i> Sebab Tidak Hadir</div>
+      <button onclick="closeReasonModal()" class="modal-close"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="modal-body" id="reason-modal-body" style="padding:16px;">
+    </div>
+  </div>
+</div>
+
 
 <!-- ═══════════════════════════════════════════════
      HIDDEN PDF TEMPLATE (untuk print)
@@ -807,7 +835,7 @@ function showConfirm({ title, msg, okLabel = 'Padam', okType = 'danger', icon = 
    Selepas deploy Apps Script sebagai Web App (Deploy → New deployment
    → Web app → Execute as: Me → Access: Anyone), salin URL /exec dan
    letak di bawah. */
-const API_URL = 'https://script.google.com/macros/s/AKfycbzJdUICFNhUcMpZbCe009iOwnUovJ8hbmvi40PH0lpfV1LD8ge7lMGgcdDfFP-B-P8u/exec';
+const API_URL = 'https://script.google.com/macros/s/GANTI_DENGAN_ID_DEPLOYMENT_ANDA/exec';
 
 /* Tambah ?mock=1 pada URL (contoh: index.html?mock=1) untuk uji UI
    tanpa sambungan backend sebenar (guna data contoh sahaja). */
@@ -834,6 +862,13 @@ function callAPI(action, payload) {
 let SCHOOL_LOGO_URL = null;
 let allTeachers = [];
 let currentBoard = null;        // state tapak harian semasa
+
+const ABSENT_REASONS = ['Urusan Rasmi', 'Cuti', 'Keluar Waktu Bekerja'];
+const REASON_STYLE = {
+  'Urusan Rasmi':          { bg: '#dbeafe', border: '#93c5fd', color: '#1e40af' },
+  'Cuti':                  { bg: '#ffedd5', border: '#fdba74', color: '#c2410c' },
+  'Keluar Waktu Bekerja':  { bg: '#ede9fe', border: '#c4b5fd', color: '#6d28d9' }
+};
 let currentAssignSlot = null;   // slot yang sedang dibuka untuk assign
 let assignSortKey = 'free';
 let busySectionOpen = false;
@@ -860,7 +895,15 @@ window.onload = function() {
   updateDateDisplay();
   loadTeachersGlobal();
   initLogo();
+  registerServiceWorker();
 };
+
+/* ── PWA: daftar service worker (untuk offline shell + "Tambah ke Skrin Utama") ── */
+function registerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.register('/sw.js')
+    .catch(err => console.warn('Pendaftaran Service Worker gagal:', err));
+}
 
 function updateDateDisplay() {
   const opt = {weekday:'short',year:'numeric',month:'short',day:'numeric'};
@@ -1026,7 +1069,7 @@ function applyBoard(board) {
   updateBoardHeader(board);
 
   // Update absent panel
-  renderAbsentPanel(board.absentIds || []);
+  renderAbsentPanel(board.absentIds || [], board.absentReasons || {});
 
   // Render timetable grid
   renderTimetable(board);
@@ -1061,7 +1104,8 @@ function updateBoardHeader(board) {
 /* ═══════════════════════════════════════════════════════════
    ABSENT PANEL
    ═══════════════════════════════════════════════════════════ */
-function renderAbsentPanel(absentIds) {
+function renderAbsentPanel(absentIds, absentReasons) {
+  absentReasons = absentReasons || {};
   const container = document.getElementById('absent-tags-container');
   const countChip = document.getElementById('absent-count-chip');
 
@@ -1089,42 +1133,103 @@ function renderAbsentPanel(absentIds) {
   absentIds.forEach(id => {
     const t = allTeachers.find(x => x.id === id);
     if (!t) return;
+    const reason = absentReasons[id] || '';
+    const s = REASON_STYLE[reason] || { bg: '#f1f5f9', border: '#cbd5e1', color: '#64748b' };
+    const reasonLabel = reason || 'Sebab?';
     const tag = document.createElement('span');
     tag.className = 'absent-tag';
-    tag.innerHTML = `<i class="fas fa-user-times" style="font-size:.6rem;flex-shrink:0;"></i><span class="absent-tag-name">${t.name}</span><button class="absent-tag-remove" onclick="removeAbsent('${id}')" title="Buang"><i class="fas fa-times"></i></button>`;
+    tag.innerHTML = `<i class="fas fa-user-times" style="font-size:.6rem;flex-shrink:0;"></i><span class="absent-tag-name">${t.name}</span><span class="absent-reason-badge" style="background:${s.bg};border-color:${s.border};color:${s.color};" onclick="openReasonModal('${id}')" title="Tukar sebab">${reasonLabel}</span><button class="absent-tag-remove" onclick="removeAbsent('${id}')" title="Buang"><i class="fas fa-times"></i></button>`;
     container.appendChild(tag);
   });
+}
+
+/* ── Modal: pilih/tukar sebab tidak hadir ── */
+let _reasonModalTeacherId = null;
+
+function openReasonModal(teacherId) {
+  _reasonModalTeacherId = teacherId;
+  const t = allTeachers.find(x => x.id === teacherId);
+  const currentReason = (currentBoard.absentReasons || {})[teacherId] || '';
+  const body = document.getElementById('reason-modal-body');
+  body.innerHTML =
+    `<div style="font-weight:800;margin-bottom:12px;color:var(--text);">${t ? t.name : ''}</div>` +
+    ABSENT_REASONS.map(r => {
+      const active = r === currentReason;
+      const s = REASON_STYLE[r];
+      const style = active
+        ? `border-color:${s.border};background:${s.bg};color:${s.color};`
+        : '';
+      return `<button class="reason-pick-btn" style="${style}" onclick="pickReason('${r.replace(/'/g, "\\'")}')">${active ? '✓ ' : ''}${r}</button>`;
+    }).join('');
+  document.getElementById('reasonModal').classList.remove('hidden');
+}
+
+function closeReasonModal() {
+  document.getElementById('reasonModal').classList.add('hidden');
+  _reasonModalTeacherId = null;
+}
+
+function pickReason(reason) {
+  const teacherId = _reasonModalTeacherId;
+  const date = document.getElementById('boardDate').value;
+  closeReasonModal();
+  if (!teacherId) return;
+
+  if (isLocal) {
+    if (!currentBoard.absentReasons) currentBoard.absentReasons = {};
+    currentBoard.absentReasons[teacherId] = reason;
+    renderAbsentPanel(currentBoard.absentIds, currentBoard.absentReasons);
+    return;
+  }
+  callAPI('updateAbsentReason', { date, teacherId, reason })
+    .then(board => {
+      if (!board.success) { showAlert(board.message, 'error'); return; }
+      applyBoard(board);
+    })
+    .catch(e => showAlert('Ralat: ' + e.message, 'error'));
 }
 
 function addAbsent() {
   const sel = document.getElementById('absent-select');
   const id  = sel.value;
   if (!id) { showAlert('Sila pilih nama guru.', 'warn'); return; }
+
+  const reasonSel = document.getElementById('absent-reason-select');
+  const reason = reasonSel.value;
+  if (!reason) { showAlert('Sila pilih sebab ketidakhadiran.', 'warn'); return; }
+
   const date = document.getElementById('boardDate').value;
   const btn  = document.querySelector('.btn-tambah');
   const origHTML = btn.innerHTML;
 
   sel.disabled = true;
+  reasonSel.disabled = true;
   btn.disabled = true;
   btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
 
-  function restoreBtn() { sel.disabled = false; btn.disabled = false; btn.innerHTML = origHTML; }
+  function restoreBtn() { sel.disabled = false; reasonSel.disabled = false; btn.disabled = false; btn.innerHTML = origHTML; }
+  function resetReasonSelect() { reasonSel.value = ''; }
+
   if (isLocal) {
     if (!currentBoard.absentIds) currentBoard.absentIds = [];
     currentBoard.absentIds.push(id);
+    if (!currentBoard.absentReasons) currentBoard.absentReasons = {};
+    currentBoard.absentReasons[id] = reason;
     Object.values(currentBoard.grid || {}).forEach(row => {
       Object.values(row).forEach(cell => {
-        if (cell.teacherId === id) cell.isAbsent = true;
+        if (cell.teacherId === id) { cell.isAbsent = true; cell.absentReason = reason; }
       });
     });
     restoreBtn();
-    renderAbsentPanel(currentBoard.absentIds);
+    resetReasonSelect();
+    renderAbsentPanel(currentBoard.absentIds, currentBoard.absentReasons);
     renderTimetable(currentBoard);
     updateBoardHeader(currentBoard);
   } else {
-    callAPI('addAbsentTeacher', { date, teacherId: id })
+    callAPI('addAbsentTeacher', { date, teacherId: id, reason })
       .then(board => {
         restoreBtn();
+        resetReasonSelect();
         if (!board.success) { showAlert(board.message, 'error'); return; }
         applyBoard(board);
       })
@@ -1148,15 +1253,16 @@ function removeAbsent(teacherId) {
       function restoreIfFail() { document.querySelectorAll('.absent-tag-remove').forEach(b => b.disabled = false); }
       if (isLocal) {
         currentBoard.absentIds = (currentBoard.absentIds || []).filter(id => id !== teacherId);
+        if (currentBoard.absentReasons) delete currentBoard.absentReasons[teacherId];
         Object.values(currentBoard.grid || {}).forEach(row => {
           Object.values(row).forEach(cell => {
-            if (cell.teacherId === teacherId) { cell.isAbsent = false; cell.reliefTeacher = ''; }
+            if (cell.teacherId === teacherId) { cell.isAbsent = false; cell.reliefTeacher = ''; cell.absentReason = ''; }
           });
         });
         Object.keys(currentBoard.assignments || {}).forEach(key => {
           if (key.startsWith(teacherId + '|')) delete currentBoard.assignments[key];
         });
-        renderAbsentPanel(currentBoard.absentIds);
+        renderAbsentPanel(currentBoard.absentIds, currentBoard.absentReasons);
         renderTimetable(currentBoard);
         updateBoardHeader(currentBoard);
       } else {
@@ -1280,6 +1386,7 @@ function renderTimetable(board) {
 
   guruList.forEach(g => {
     const isAbsent = absentSet.has(g.id);
+    const reason = (board.absentReasons || {})[g.id] || '';
     // Nama guru — potong kalau panjang
     const nameParts = g.name.split(' ');
     const shortName = nameParts.length > 3
@@ -1289,7 +1396,7 @@ function renderTimetable(board) {
     html += `<tr>`;
     html += `<td class="tt-sticky tt-guru-cell ${isAbsent ? 'tt-guru-absent' : ''}">
       <span class="tt-guru-name">${escHtml(shortName)}</span>
-      ${isAbsent ? '<span class="tt-guru-tag">✗ Tak Hadir</span>' : ''}
+      ${isAbsent ? `<span class="tt-guru-tag" title="${escHtml(reason)}">✗ ${reason || 'Tak Hadir'}</span>` : ''}
     </td>`;
 
     periods.forEach(p => {
@@ -2047,22 +2154,31 @@ function buildPDFHTML(board) {
   const months = ['Januari','Februari','Mac','April','Mei','Jun','Julai','Ogos','September','Oktober','November','Disember'];
   const fullDate = `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
 
-  // Kumpul semua slot yang perlu ganti
-  const absentSlots = [];
+  // Kumpul semua slot yang perlu ganti — guna teacherMap (BUKAN grid).
+  // grid overwrite bila 2 guru kongsi kelas-waktu sama (team-teaching),
+  // jadi cell.isAbsent/teacherName boleh salah rujuk guru LAIN yang tak
+  // tak-hadir, menyebabkan slot tu terus HILANG dari laporan PDF.
+  // teacherMap simpan setiap guru berasingan — tiada overwrite.
   const absentIds = board.absentIds || [];
   const absentTeacherGroups = {};
 
-  (board.classes || []).forEach(cls => {
-    (board.periods || []).forEach(p => {
-      if (p.id === 'REHAT') return;
-      const cell = board.grid?.[cls]?.[p.id];
-      if (!cell || !cell.isAbsent) return;
-      if (!absentTeacherGroups[cell.teacherName]) absentTeacherGroups[cell.teacherName] = [];
-      absentTeacherGroups[cell.teacherName].push({
-        period: p.id, time: `${p.start} – ${p.end}`,
-        className: cls, subject: cell.subject,
-        reliefTeacher: cell.reliefTeacher || '—',
-        note: cell.note || ''
+  absentIds.forEach(teacherId => {
+    const tMap = board.teacherMap?.[teacherId];
+    if (!tMap) return;
+    const teacherName = tMap.name || '';
+    Object.keys(tMap).forEach(periodId => {
+      if (periodId === 'name' || periodId === 'id' || periodId === 'REHAT') return;
+      const p = (board.periods || []).find(pp => pp.id === periodId);
+      if (!p) return;
+      (tMap[periodId] || []).forEach(slot => {
+        if (!absentTeacherGroups[teacherName]) absentTeacherGroups[teacherName] = [];
+        absentTeacherGroups[teacherName].push({
+          period: periodId, time: `${p.start} – ${p.end}`,
+          className: slot.className, subject: slot.subject,
+          reliefTeacher: slot.reliefTeacher || '—',
+          note: slot.note || '',
+          reason: slot.absentReason || ''
+        });
       });
     });
   });
@@ -2074,6 +2190,10 @@ function buildPDFHTML(board) {
   let teacherTablesHtml = '';
   Object.entries(absentTeacherGroups).forEach(([teacherName, slots]) => {
     slots.sort((a,b) => parseInt(a.period) - parseInt(b.period));
+    const reason = slots[0]?.reason || '';
+    const reasonBadge = reason
+      ? `<div style="margin-left:8px;background:rgba(255,255,255,.15);border-radius:6px;padding:3px 8px;font-size:.68rem;font-weight:700;color:white;">${escHtml(reason)}</div>`
+      : '';
     const rows = slots.map(s => `
       <tr>
         <td style="padding:9px 12px;border-bottom:1px solid #f0f4fa;font-weight:700;text-align:center;">${s.period}</td>
@@ -2092,6 +2212,7 @@ function buildPDFHTML(board) {
             <div style="font-size:.9rem;font-weight:900;color:white;">${escHtml(teacherName)}</div>
           </div>
           <div style="margin-left:auto;background:rgba(255,255,255,.12);border-radius:6px;padding:4px 10px;font-size:.7rem;color:rgba(255,255,255,.8);font-weight:700;">${slots.length} waktu</div>
+          ${reasonBadge}
         </div>
         <table style="width:100%;border-collapse:collapse;font-size:.85rem;">
           <thead>
@@ -2218,6 +2339,11 @@ function renderHistory(records, dateStr) {
   container.innerHTML = '';
   Object.entries(grouped).forEach(([teacher, slots]) => {
     slots.sort((a,b) => parseInt(a.period) - parseInt(b.period));
+    const reason = slots[0]?.reason || '';
+    const rs = REASON_STYLE[reason] || { bg: 'rgba(255,255,255,.15)', color: 'rgba(255,255,255,.9)' };
+    const reasonHtml = reason
+      ? `<div class="archive-reason-badge" style="display:inline-block;margin-top:4px;padding:2px 8px;border-radius:20px;font-size:.62rem;font-weight:800;background:${rs.bg};color:${rs.color};">${escHtml(reason)}</div>`
+      : '';
     const rows = slots.map(s => `
       <tr>
         <td>${s.period}</td>
@@ -2234,6 +2360,7 @@ function renderHistory(records, dateStr) {
         <div>
           <div style="font-size:.65rem;color:rgba(255,255,255,.55);font-weight:700;text-transform:uppercase;">Guru Tidak Hadir</div>
           <div style="font-weight:900;font-size:.95rem;">${escHtml(teacher)}</div>
+          ${reasonHtml}
         </div>
         <div style="font-size:.7rem;color:rgba(255,255,255,.7);">${dateStr}</div>
       </div>
@@ -2268,6 +2395,7 @@ function printArchive() {
 
   const cardsHtml = Array.from(container.querySelectorAll('.archive-card')).map(card => {
     const teacher = card.querySelector('.archive-card-head div div:nth-child(2)')?.textContent?.trim() || '';
+    const reasonBadge = card.querySelector('.archive-reason-badge')?.textContent?.trim() || '';
     const rows    = Array.from(card.querySelectorAll('tbody tr')).map(tr => {
       const tds = tr.querySelectorAll('td');
       return `<tr>
@@ -2281,7 +2409,9 @@ function printArchive() {
     return `<div style="margin-bottom:16px;border-radius:10px;border:2px solid #e2e8f0;overflow:hidden;">
       <div style="background:#0f2044;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;">
         <div><div style="font-size:.6rem;color:rgba(255,255,255,.5);font-weight:700;text-transform:uppercase;">Guru Tidak Hadir</div>
-        <div style="font-weight:900;font-size:.88rem;color:white;">${teacher}</div></div>
+        <div style="font-weight:900;font-size:.88rem;color:white;">${teacher}</div>
+        ${reasonBadge ? `<div style="display:inline-block;margin-top:4px;padding:2px 8px;border-radius:20px;font-size:.6rem;font-weight:800;background:rgba(255,255,255,.15);color:white;">${reasonBadge}</div>` : ''}
+        </div>
       </div>
       <table style="width:100%;border-collapse:collapse;font-size:.82rem;">
         <thead><tr style="background:#f8faff;">
