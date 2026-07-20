@@ -427,6 +427,9 @@
           <button onclick="generatePDF()" class="btn btn-success btn-sm" id="btn-gen-pdf">
             <i class="fas fa-file-pdf"></i> Jana PDF
           </button>
+          <button onclick="emailJadualGuruGanti()" class="btn btn-secondary btn-sm" id="btn-email-pdf">
+            <i class="fas fa-envelope"></i> Hantar Emel
+          </button>
         </div>
       </div>
 
@@ -541,6 +544,9 @@
         <button onclick="printArchive()" class="btn btn-success btn-sm">
           <i class="fas fa-file-pdf"></i> Jana PDF
         </button>
+        <button onclick="emailArchivePDF()" class="btn btn-secondary btn-sm" id="btn-email-archive">
+          <i class="fas fa-envelope"></i> Hantar Emel
+        </button>
       </div>
       <div id="history-container"></div>
     </div>
@@ -639,6 +645,24 @@
             <div style="color:var(--muted);font-size:.68rem;margin-top:6px;">PNG/JPG · Saiz disyorkan: 200×200px · PNG latar lutsinar lebih cantik</div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- Emel Pentadbir -->
+    <div class="card admin-section">
+      <div class="card-head">
+        <div class="card-head-icon" style="background:linear-gradient(135deg,#059669,#047857);"><i class="fas fa-envelope"></i></div>
+        <div><div class="card-head-title">Emel Pentadbir</div><div class="card-head-sub">Alamat emel penerima bila butang "Hantar Emel" digunakan</div></div>
+      </div>
+      <div class="card-body">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <input type="email" id="adminEmailInput" placeholder="pentadbir@sekolah.edu.my" class="input-field" style="flex:1;min-width:200px;">
+          <button id="btn-save-admin-email" onclick="saveAdminEmailAction()" class="btn btn-success btn-sm" style="height:40px;">
+            <i class="fas fa-save"></i> Simpan
+          </button>
+        </div>
+        <div style="color:var(--muted);font-size:.68rem;margin-top:6px;">PDF akan dihantar ke alamat ini sahaja bila anda klik butang "Hantar Emel" di Tapak Harian / Arkib. Kosongkan &amp; simpan untuk buang.</div>
+        <div id="admin-email-status" style="font-size:.72rem;font-weight:700;margin-top:6px;"></div>
       </div>
     </div>
 
@@ -888,6 +912,17 @@ function getReliefNote(val) {
   return val.note || '';
 }
 
+/* ── Helper: format tarikh "YYYY-MM-DD" → "20 Julai 2026" (BM) ──
+   Dikongsi oleh semua fungsi print (nama tab/fail "Save as PDF") dan
+   emel (subjek emel) supaya konsisten format "Nama Dokumen - Tarikh". */
+const BM_MONTHS = ['Januari','Februari','Mac','April','Mei','Jun','Julai','Ogos','September','Oktober','November','Disember'];
+function formatTarikhBM(dateStr) {
+  if (!dateStr) return '';
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d.getTime())) return dateStr;
+  return `${d.getDate()} ${BM_MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+}
+
 window.onload = function() {
   const today = new Date().toISOString().split('T')[0];
   document.getElementById('boardDate').value = today;
@@ -895,6 +930,7 @@ window.onload = function() {
   updateDateDisplay();
   loadTeachersGlobal();
   initLogo();
+  loadAdminEmailSetting();
   registerServiceWorker();
 };
 
@@ -923,6 +959,71 @@ function initLogo() {
       document.getElementById('navbar-icon-fallback').style.display = 'flex';
     }
   }).catch(e => { document.getElementById('navbar-icon-fallback').style.display = 'flex'; });
+}
+
+/* ── Tetapan Emel Pentadbir ── */
+function loadAdminEmailSetting() {
+  if (isLocal) return;
+  callAPI('getAdminEmail').then(email => {
+    const input = document.getElementById('adminEmailInput');
+    if (input) input.value = email || '';
+  }).catch(() => {});
+}
+
+function saveAdminEmailAction() {
+  const input  = document.getElementById('adminEmailInput');
+  const status = document.getElementById('admin-email-status');
+  const btn    = document.getElementById('btn-save-admin-email');
+  const email  = (input?.value || '').trim();
+
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+
+  callAPI('saveAdminEmail', email)
+    .then(res => {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-save"></i> Simpan';
+      if (res.success) {
+        if (status) { status.style.color = '#059669'; status.textContent = email ? '✅ Emel pentadbir disimpan.' : 'Emel pentadbir dibuang.'; }
+        showAlert(email ? '✅ Emel pentadbir disimpan!' : 'Emel pentadbir dibuang.', 'success');
+      } else {
+        if (status) { status.style.color = '#dc2626'; status.textContent = '❌ ' + (res.message || 'Gagal simpan.'); }
+        showAlert('Gagal simpan: ' + (res.message || ''), 'error');
+      }
+    })
+    .catch(err => {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-save"></i> Simpan';
+      showAlert('Ralat: ' + err.message, 'error');
+    });
+}
+
+/* ── Hantar PDF ke Emel Pentadbir (on-demand) ──
+   Fungsi teras dikongsi oleh Tapak Harian & Arkib. Penerima ditentukan
+   di SERVER (ADMIN_EMAIL dalam Tetapan) — klien tidak hantar alamat
+   emel, jadi butang ini hanya boleh hantar ke alamat yang admin sendiri
+   dah tetapkan. */
+function sendPDFToAdminEmail(htmlContent, filenameBase, dateStr, btn) {
+  if (!btn) return;
+  const tarikhLabel = formatTarikhBM(dateStr);
+  const docTitle = `${filenameBase} - ${tarikhLabel}`;
+  const origHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menghantar...';
+
+  callAPI('sendPDFEmail', { htmlContent, filename: docTitle, dateLabel: tarikhLabel })
+    .then(res => {
+      btn.disabled = false; btn.innerHTML = origHTML;
+      if (res.success) {
+        showAlert(`✅ PDF berjaya dihantar ke ${res.sentTo}`, 'success');
+      } else {
+        showAlert('Gagal hantar emel: ' + (res.message || ''), 'error');
+      }
+    })
+    .catch(err => {
+      btn.disabled = false; btn.innerHTML = origHTML;
+      showAlert('Ralat: ' + err.message, 'error');
+    });
 }
 
 function loadTeachersGlobal() {
@@ -1597,7 +1698,7 @@ function _doPrintJadualInduk(board, dayName, dateStr) {
 <html lang="ms">
 <head>
 <meta charset="UTF-8">
-<title>Jadual Induk — ${escHtml(schoolName)}</title>
+<title>Jadual Induk - ${dateStr ? formatTarikhBM(dateStr) : escHtml(dayName)}</title>
 <style>
   @page { size: A4 landscape; margin: 10mm 12mm; }
   *{ box-sizing:border-box; margin:0; padding:0; }
@@ -1684,7 +1785,7 @@ function _doPrintJadualInduk(board, dayName, dateStr) {
 </body>
 </html>`;
 
-  _openPrint(html, 'Jadual Induk — ' + dayName);
+  _openPrint(html, 'Jadual Induk - ' + (dateStr ? formatTarikhBM(dateStr) : dayName));
 }
 
 
@@ -2067,12 +2168,15 @@ function generatePDF() {
   const htmlContent = buildPDFHTML(currentBoard);
   document.getElementById('pdf-template').innerHTML = htmlContent;
 
+  // FIX: nama fail/tab ikut format "Jadual Guru Ganti - <Tarikh BM>"
+  const docTitle = `Jadual Guru Ganti - ${formatTarikhBM(currentBoard.date)}`;
+
   // Android / iOS — skip server PDF terus, guna print modal
   if (isMobile || isLocal) {
     btn.disabled = false; btn.innerHTML = origHTML;
     closePdfModal();
-    const fullHtml = _wrapPrintHTML(htmlContent, 'Jadual Guru Ganti');
-    _openPrint(fullHtml, 'Jadual Guru Ganti — ' + (currentBoard.date || ''));
+    const fullHtml = _wrapPrintHTML(htmlContent, docTitle);
+    _openPrint(fullHtml, docTitle);
     return;
   }
 
@@ -2086,14 +2190,14 @@ function generatePDF() {
     </div>`;
   document.getElementById('btn-download-pdf').style.display = 'none';
 
-  callAPI('generatePDFServer', { htmlContent, filename: `Jadual_Guru_Ganti_${currentBoard.date}` })
+  callAPI('generatePDFServer', { htmlContent, filename: docTitle })
     .then(res => {
       btn.disabled = false; btn.innerHTML = origHTML;
       if (!res.success) {
         // Fallback ke print dialog (desktop)
         closePdfModal();
-        const fullHtml = _wrapPrintHTML(htmlContent, 'Jadual Guru Ganti');
-        _openPrint(fullHtml, 'Jadual Guru Ganti — ' + (currentBoard.date || ''));
+        const fullHtml = _wrapPrintHTML(htmlContent, docTitle);
+        _openPrint(fullHtml, docTitle);
         showAlert('PDF server gagal, guna print dialog. ' + (res.message||''), 'warn');
         return;
       }
@@ -2102,7 +2206,7 @@ function generatePDF() {
       const blob    = new Blob([byteArr], { type: 'application/pdf' });
       const url     = URL.createObjectURL(blob);
       const a       = document.createElement('a');
-      a.href = url; a.download = `Jadual_Guru_Ganti_${currentBoard.date}.pdf`;
+      a.href = url; a.download = `${docTitle}.pdf`;
       document.body.appendChild(a); a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
@@ -2117,10 +2221,17 @@ function generatePDF() {
     .catch(e => {
       btn.disabled = false; btn.innerHTML = origHTML;
       closePdfModal();
-      const fullHtml = _wrapPrintHTML(htmlContent, 'Jadual Guru Ganti');
-      _openPrint(fullHtml, 'Jadual Guru Ganti — ' + (currentBoard.date || ''));
+      const fullHtml = _wrapPrintHTML(htmlContent, docTitle);
+      _openPrint(fullHtml, docTitle);
       showAlert('Guna print dialog sebagai alternatif.', 'warn');
     });
+}
+
+function emailJadualGuruGanti() {
+  if (!currentBoard) { showAlert('Tiada tapak untuk dihantar.', 'warn'); return; }
+  const htmlContent = buildPDFHTML(currentBoard);
+  const btn = document.getElementById('btn-email-pdf');
+  sendPDFToAdminEmail(htmlContent, 'Jadual Guru Ganti', currentBoard.date, btn);
 }
 
 /* Bungkus HTML content dalam dokumen print lengkap */
@@ -2146,8 +2257,9 @@ function _wrapPrintHTML(content, title) {
 function showPDFPreviewFallback(htmlContent) {
   // Dikekalkan untuk compatibility — redirect ke _openPrint
   closePdfModal();
-  const fullHtml = _wrapPrintHTML(htmlContent, 'Jadual Guru Ganti');
-  _openPrint(fullHtml, 'Jadual Guru Ganti');
+  const docTitle = `Jadual Guru Ganti - ${formatTarikhBM(currentBoard?.date)}`;
+  const fullHtml = _wrapPrintHTML(htmlContent, docTitle);
+  _openPrint(fullHtml, docTitle);
 }
 
 function buildPDFHTML(board) {
@@ -2266,11 +2378,13 @@ function downloadPDF() {
   const content = document.getElementById('pdf-template').innerHTML;
   if (!content) return;
 
+  const docTitle = `Jadual Guru Ganti - ${formatTarikhBM(currentBoard?.date)}`;
+
   const fullHtml = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Jadual Guru Ganti</title>
+  <title>${docTitle}</title>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -2285,7 +2399,7 @@ function downloadPDF() {
   ${content}
 </body>
 </html>`;
-  _openPrint(fullHtml, 'Jadual Guru Ganti');
+  _openPrint(fullHtml, docTitle);
 }
 
 function closePdfModal() {
@@ -2377,20 +2491,13 @@ function renderHistory(records, dateStr) {
   });
 }
 
-function printArchive() {
-  const date = document.getElementById('historyDate').value;
+/* Bina HTML arkib untuk tarikh tertentu — dikongsi oleh printArchive()
+   dan emailArchivePDF(). Pulang null jika tiada rekod untuk dipaparkan. */
+function buildArchiveHTML(date) {
   const container = document.getElementById('history-container');
-  if (!container.querySelector('.archive-card')) { showAlert('Tiada rekod untuk dicetak.', 'warn'); return; }
+  if (!container.querySelector('.archive-card')) return null;
 
-  const btn = document.querySelector('button[onclick="printArchive()"]');
-  const origHTML = btn.innerHTML;
-  btn.disabled = true;
-  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menjana...';
-
-  // Bina HTML arkib
-  const months = ['Januari','Februari','Mac','April','Mei','Jun','Julai','Ogos','September','Oktober','November','Disember'];
-  const d = new Date(date + 'T00:00:00');
-  const fullDate = `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
+  const fullDate = formatTarikhBM(date);
 
   const logoHtml = SCHOOL_LOGO_URL
     ? `<img src="${SCHOOL_LOGO_URL}" style="width:50px;height:50px;object-fit:contain;border-radius:6px;">`
@@ -2429,7 +2536,7 @@ function printArchive() {
     </div>`;
   }).join('');
 
-  const htmlContent = `<div style="padding:20px 24px;font-family:Arial,sans-serif;color:#1e2d4a;max-width:800px;">
+  return `<div style="padding:20px 24px;font-family:Arial,sans-serif;color:#1e2d4a;max-width:800px;">
     <div style="display:flex;align-items:center;gap:14px;margin-bottom:16px;padding-bottom:14px;border-bottom:2px solid #e2e8f0;">
       ${logoHtml}
       <div style="flex:1;">
@@ -2444,6 +2551,17 @@ function printArchive() {
       Dijana oleh Sistem Guru Ganti K-SpeEdS · SK Pendidikan Khas Kuantan
     </div>
   </div>`;
+}
+
+function printArchive() {
+  const date = document.getElementById('historyDate').value;
+  const htmlContent = buildArchiveHTML(date);
+  if (!htmlContent) { showAlert('Tiada rekod untuk dicetak.', 'warn'); return; }
+
+  const btn = document.querySelector('button[onclick="printArchive()"]');
+  const origHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menjana...';
 
   const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
 
@@ -2455,7 +2573,8 @@ function printArchive() {
   }
 
   // Desktop — cuba server-side PDF
-  callAPI('generatePDFServer', { htmlContent, filename: `Arkib_Guru_Ganti_${date}` })
+  const archiveDocTitle = `Arkib Guru Ganti - ${formatTarikhBM(date)}`;
+  callAPI('generatePDFServer', { htmlContent, filename: archiveDocTitle })
     .then(res => {
       btn.disabled = false; btn.innerHTML = origHTML;
       if (!res.success) { openPrintWindow(htmlContent, date); return; }
@@ -2463,7 +2582,7 @@ function printArchive() {
       const blob    = new Blob([byteArr], { type: 'application/pdf' });
       const url     = URL.createObjectURL(blob);
       const a       = document.createElement('a');
-      a.href = url; a.download = `Arkib_Guru_Ganti_${date}.pdf`;
+      a.href = url; a.download = `${archiveDocTitle}.pdf`;
       document.body.appendChild(a); a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
@@ -2476,7 +2595,20 @@ function printArchive() {
 }
 
 function openPrintWindow(htmlContent, date) {
-  _openPrint(htmlContent, 'Arkib Guru Ganti ' + date);
+  // FIX: bungkus dengan _wrapPrintHTML supaya ada <title> sebenar
+  // (sebelum ini htmlContent mentah dihantar terus tanpa <title>,
+  // jadi nama fail "Save as PDF" browser tidak tepat).
+  const docTitle = `Arkib Guru Ganti - ${formatTarikhBM(date)}`;
+  const fullHtml = _wrapPrintHTML(htmlContent, docTitle);
+  _openPrint(fullHtml, docTitle);
+}
+
+function emailArchivePDF() {
+  const date = document.getElementById('historyDate').value;
+  const htmlContent = buildArchiveHTML(date);
+  if (!htmlContent) { showAlert('Tiada rekod untuk dihantar.', 'warn'); return; }
+  const btn = document.getElementById('btn-email-archive');
+  sendPDFToAdminEmail(htmlContent, 'Arkib Guru Ganti', date, btn);
 }
 
 /* ═══════════════════════════════════════════════════════════
