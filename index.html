@@ -8,6 +8,8 @@
   <meta name="theme-color" content="#1a3580">
   <link rel="icon" type="image/png" href="/icon-192.png">
   <link rel="apple-touch-icon" href="/icon-192.png">
+  <!-- html2pdf.js — jana PDF terus dalam browser, TIDAK perlukan Google Drive API -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
   <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
 
@@ -923,6 +925,55 @@ function formatTarikhBM(dateStr) {
   return `${d.getDate()} ${BM_MONTHS[d.getMonth()]} ${d.getFullYear()}`;
 }
 
+/* ═══════════════════════════════════════════════════════════
+   JANA PDF — CLIENT-SIDE (html2pdf.js), TIDAK PERLUKAN GOOGLE
+   DRIVE API. Sebelum ini sistem upload HTML→Drive→Google Doc→
+   export PDF, yang disekat oleh dasar domain Google Workspace
+   sekolah (403 insufficientPermissions walaupun scope betul).
+   Kaedah ni jana PDF terus dalam browser pengguna.
+   ═══════════════════════════════════════════════════════════ */
+function _generatePdfBlob(htmlContent, title, orientation) {
+  return new Promise((resolve, reject) => {
+    if (typeof html2pdf === 'undefined') {
+      reject(new Error('Library html2pdf gagal dimuatkan (semak sambungan internet).'));
+      return;
+    }
+    const container = document.createElement('div');
+    container.style.cssText = 'position:fixed;left:-9999px;top:0;width:794px;background:#fff;';
+    container.innerHTML = `<div style="font-family:'Plus Jakarta Sans',Arial,sans-serif;">${htmlContent}</div>`;
+    document.body.appendChild(container);
+
+    html2pdf().set({
+      margin: 8,
+      filename: title + '.pdf',
+      image: { type: 'jpeg', quality: 0.95 },
+      html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff' },
+      jsPDF: { unit: 'mm', format: 'a4', orientation: orientation || 'portrait' },
+      pagebreak: { mode: ['css', 'legacy'] }
+    }).from(container).outputPdf('blob')
+      .then(blob => { document.body.removeChild(container); resolve(blob); })
+      .catch(err => { document.body.removeChild(container); reject(err); });
+  });
+}
+
+function _generatePdfBase64(htmlContent, title, orientation) {
+  return _generatePdfBlob(htmlContent, title, orientation).then(blob => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result.split(',')[1]);
+    reader.onerror   = reject;
+    reader.readAsDataURL(blob);
+  }));
+}
+
+function _downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 window.onload = function() {
   const today = new Date().toISOString().split('T')[0];
   document.getElementById('boardDate').value = today;
@@ -1009,9 +1060,13 @@ function sendPDFToAdminEmail(htmlContent, filenameBase, dateStr, btn) {
   const docTitle = `${filenameBase} - ${tarikhLabel}`;
   const origHTML = btn.innerHTML;
   btn.disabled = true;
-  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menghantar...';
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menjana PDF...';
 
-  callAPI('sendPDFEmail', { htmlContent, filename: docTitle, dateLabel: tarikhLabel })
+  _generatePdfBase64(htmlContent, docTitle)
+    .then(base64Pdf => {
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menghantar...';
+      return callAPI('sendPDFEmail', { base64Pdf, filename: docTitle, dateLabel: tarikhLabel });
+    })
     .then(res => {
       btn.disabled = false; btn.innerHTML = origHTML;
       if (res.success) {
@@ -1022,7 +1077,8 @@ function sendPDFToAdminEmail(htmlContent, filenameBase, dateStr, btn) {
     })
     .catch(err => {
       btn.disabled = false; btn.innerHTML = origHTML;
-      showAlert('Ralat: ' + err.message, 'error');
+      showAlert('Ralat jana/hantar PDF: ' + err.message, 'error');
+      console.error(err);
     });
 }
 
@@ -2171,7 +2227,7 @@ function generatePDF() {
   // FIX: nama fail/tab ikut format "Jadual Guru Ganti - <Tarikh BM>"
   const docTitle = `Jadual Guru Ganti - ${formatTarikhBM(currentBoard.date)}`;
 
-  // Android / iOS — skip server PDF terus, guna print modal
+  // Android / iOS — guna print modal terus (lebih stabil pada mobile)
   if (isMobile || isLocal) {
     btn.disabled = false; btn.innerHTML = origHTML;
     closePdfModal();
@@ -2180,7 +2236,7 @@ function generatePDF() {
     return;
   }
 
-  // Desktop — cuba server-side PDF (download terus)
+  // Desktop — jana PDF terus dalam browser (client-side, TIADA Drive)
   document.getElementById('pdfModal').classList.remove('hidden');
   document.getElementById('pdf-modal-body').innerHTML = `
     <div class="state-box" style="border-radius:0;border:none;background:#e5e7eb;">
@@ -2190,26 +2246,12 @@ function generatePDF() {
     </div>`;
   document.getElementById('btn-download-pdf').style.display = 'none';
 
-  callAPI('generatePDFServer', { htmlContent, filename: docTitle })
-    .then(res => {
+  _generatePdfBlob(htmlContent, docTitle)
+    .then(blob => {
       btn.disabled = false; btn.innerHTML = origHTML;
-      if (!res.success) {
-        // Fallback ke print dialog (desktop)
-        closePdfModal();
-        const fullHtml = _wrapPrintHTML(htmlContent, docTitle);
-        _openPrint(fullHtml, docTitle);
-        showAlert('PDF server gagal, guna print dialog. ' + (res.message||''), 'warn');
-        return;
-      }
-      // Download PDF berjaya
-      const byteArr = Uint8Array.from(atob(res.base64), c => c.charCodeAt(0));
-      const blob    = new Blob([byteArr], { type: 'application/pdf' });
-      const url     = URL.createObjectURL(blob);
-      const a       = document.createElement('a');
-      a.href = url; a.download = `${docTitle}.pdf`;
-      document.body.appendChild(a); a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      window._lastPdfBlob = blob;
+      window._lastPdfFilename = docTitle + '.pdf';
+      _downloadBlob(blob, docTitle + '.pdf');
       document.getElementById('pdf-modal-body').innerHTML = `
         <div class="state-box" style="border-radius:0;border:none;background:#e5e7eb;">
           <div class="state-icon" style="background:#dcfce7;"><i class="fas fa-check" style="color:#059669;"></i></div>
@@ -2223,7 +2265,8 @@ function generatePDF() {
       closePdfModal();
       const fullHtml = _wrapPrintHTML(htmlContent, docTitle);
       _openPrint(fullHtml, docTitle);
-      showAlert('Guna print dialog sebagai alternatif.', 'warn');
+      showAlert('Penjanaan PDF automatik gagal, guna print dialog sebagai alternatif.', 'warn');
+      console.error(e);
     });
 }
 
@@ -2375,11 +2418,14 @@ function buildPDFHTML(board) {
 }
 
 function downloadPDF() {
+  if (window._lastPdfBlob) {
+    _downloadBlob(window._lastPdfBlob, window._lastPdfFilename || 'Jadual Guru Ganti.pdf');
+    return;
+  }
+  // Fallback (sepatutnya jarang berlaku — blob belum sedia)
   const content = document.getElementById('pdf-template').innerHTML;
   if (!content) return;
-
   const docTitle = `Jadual Guru Ganti - ${formatTarikhBM(currentBoard?.date)}`;
-
   const fullHtml = `<!DOCTYPE html>
 <html>
 <head>
@@ -2572,25 +2618,2957 @@ function printArchive() {
     return;
   }
 
-  // Desktop — cuba server-side PDF
+  // Desktop — jana PDF terus dalam browser (client-side, TIADA Drive)
   const archiveDocTitle = `Arkib Guru Ganti - ${formatTarikhBM(date)}`;
-  callAPI('generatePDFServer', { htmlContent, filename: archiveDocTitle })
-    .then(res => {
+  _generatePdfBlob(htmlContent, archiveDocTitle)
+    .then(blob => {
       btn.disabled = false; btn.innerHTML = origHTML;
-      if (!res.success) { openPrintWindow(htmlContent, date); return; }
-      const byteArr = Uint8Array.from(atob(res.base64), c => c.charCodeAt(0));
-      const blob    = new Blob([byteArr], { type: 'application/pdf' });
-      const url     = URL.createObjectURL(blob);
-      const a       = document.createElement('a');
-      a.href = url; a.download = `${archiveDocTitle}.pdf`;
-      document.body.appendChild(a); a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      _downloadBlob(blob, archiveDocTitle + '.pdf');
       showAlert('✅ PDF arkib berjaya dimuat turun!', 'success');
     })
     .catch(e => {
       btn.disabled = false; btn.innerHTML = origHTML;
       openPrintWindow(htmlContent, date);
+      showAlert('Penjanaan PDF automatik gagal, guna print dialog sebagai alternatif.', 'warn');
+      console.error(e);
+    });
+}
+
+function openPrintWindow(htmlContent, date) {
+  // FIX: bungkus dengan _wrapPrintHTML supaya ada <title> sebenar
+  // (sebelum ini htmlContent mentah dihantar terus tanpa <title>,
+  // jadi nama fail "Save as PDF" browser tidak tepat).
+  const docTitle = `Arkib Guru Ganti - ${formatTarikhBM(date)}`;
+  const fullHtml = _wrapPrintHTML(htmlContent, docTitle);
+  _openPrint(fullHtml, docTitle);
+}
+
+function emailArchivePDF() {
+  const date = document.getElementById('historyDate').value;
+  const htmlContent = buildArchiveHTML(date);
+  if (!htmlContent) { showAlert('Tiada rekod untuk dihantar.', 'warn'); return; }
+  const btn = document.getElementById('btn-email-archive');
+  sendPDFToAdminEmail(htmlContent, 'Arkib Guru Ganti', date, btn);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ADMIN — LOGO
+   ═══════════════════════════════════════════════════════════ */
+function loadAdminLogoPreview() {
+  if (!SCHOOL_LOGO_URL) return;
+  const img   = document.getElementById('logo-preview-img');
+  const empty = document.getElementById('logo-preview-empty');
+  if (img && empty) { img.src = SCHOOL_LOGO_URL; img.style.display = 'block'; empty.style.display = 'none'; }
+}
+
+function previewLogo(event) {
+  const file = event.target.files[0]; if (!file) return;
+  if (file.size > 500 * 1024) { showAlert('Fail terlalu besar. Sila gunakan gambar bawah 500KB.', 'error'); event.target.value = ''; return; }
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const b64  = e.target.result;
+    const img  = document.getElementById('logo-preview-img');
+    const empty= document.getElementById('logo-preview-empty');
+    img.src = b64; img.style.display = 'block'; empty.style.display = 'none';
+    window._pendingLogo = b64;
+    document.getElementById('btn-save-logo').style.display = '';
+  };
+  reader.readAsDataURL(file);
+}
+
+function saveLogoAction() {
+  if (!window._pendingLogo) return;
+  const btn = document.getElementById('btn-save-logo');
+  btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+  callAPI('saveLogo', window._pendingLogo)
+    .then(function(res) {
+      btn.disabled = false; btn.style.display = 'none'; btn.innerHTML = '<i class="fas fa-save"></i> Simpan';
+      if (res.success) {
+        SCHOOL_LOGO_URL = window._pendingLogo; window._pendingLogo = null;
+        document.querySelectorAll('.school-logo-img').forEach(img => { img.src = SCHOOL_LOGO_URL; img.style.display = ''; });
+        showAlert('✅ Logo berjaya disimpan!', 'success');
+      } else { showAlert('Gagal simpan: ' + res.message, 'error'); }
+    })
+    .catch(function(err) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-save"></i> Simpan'; showAlert('Ralat: ' + err.message, 'error'); });
+}
+
+function removeLogoAction() {
+  showConfirm({
+    title: 'Padam Logo Sekolah',
+    msg: 'Logo sekolah akan dipadam dari sistem. Anda boleh upload semula bila-bila masa.',
+    okLabel: 'Ya, Padam',
+    okType: 'danger',
+    icon: 'image',
+    onOk: () => {
+      callAPI('saveLogo', null)
+        .then(function(res) {
+          if (res.success) {
+            SCHOOL_LOGO_URL = null; window._pendingLogo = null;
+            const img  = document.getElementById('logo-preview-img');
+            const empty= document.getElementById('logo-preview-empty');
+            if (img)   { img.style.display = 'none'; img.src = ''; }
+            if (empty) empty.style.display = '';
+            document.getElementById('btn-save-logo').style.display = 'none';
+            document.getElementById('logoFileInput').value = '';
+            document.querySelectorAll('.school-logo-img').forEach(i => i.style.display = 'none');
+            showAlert('Logo dipadam.', 'success');
+          }
+        })
+        .catch(err => showAlert('Ralat: ' + err.message, 'error'));
+    }
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ADMIN — GURU TAMBAHAN
+   ═══════════════════════════════════════════════════════════ */
+function loadExtraTeachersAdmin() {
+  const list = document.getElementById('extra-teacher-list');
+  if (!list) return;
+  list.innerHTML = '<div style="padding:14px;text-align:center;color:var(--muted);font-size:.85rem;"><i class="fas fa-spinner fa-spin"></i> Memuatkan...</div>';
+  if (isLocal) { renderExtraTeacherList([]); return; }
+  callAPI('getExtraTeachers')
+    .then(renderExtraTeacherList)
+    .catch(err => { list.innerHTML = '<div style="color:#e53e3e;padding:12px;font-size:.85rem;">Gagal: ' + err.message + '</div>'; });
+}
+
+function renderExtraTeacherList(teachers) {
+  const list = document.getElementById('extra-teacher-list');
+  if (!list) return;
+  if (!teachers || !teachers.length) {
+    list.innerHTML = '<div style="padding:18px;text-align:center;color:var(--muted);font-size:.85rem;"><i class="fas fa-user-slash" style="margin-right:6px;"></i>Tiada guru tambahan lagi.</div>';
+    return;
+  }
+  let html = '<div style="display:flex;flex-direction:column;gap:8px;">';
+  teachers.forEach(t => {
+    html += `<div style="display:flex;align-items:center;justify-content:space-between;background:#f8fafc;border:1px solid #e2e8f0;border-radius:9px;padding:10px 13px;">
+      <div>
+        <div style="font-weight:700;font-size:.88rem;color:var(--navy);">${t.name}</div>
+        <div style="font-size:.7rem;color:var(--muted);">Singkatan: <strong>${t.short || '—'}</strong> · ID: <code style="font-size:.65rem;">${t.id}</code></div>
+      </div>
+      <button onclick="deleteExtraTeacherAction('${t.id}')" class="btn-ghost btn-sm" style="color:#e53e3e;border-color:#e53e3e;" title="Padam">
+        <i class="fas fa-trash" style="font-size:.75rem;"></i>
+      </button>
+    </div>`;
+  });
+  html += '</div>';
+  list.innerHTML = html;
+}
+
+function addExtraTeacherAction(e) {
+  const nameEl  = document.getElementById('extraTeacherName');
+  const shortEl = document.getElementById('extraTeacherShort');
+  const name    = nameEl.value.trim().toUpperCase();
+  const short   = shortEl.value.trim().toUpperCase();
+  if (!name) { showAlert('Sila masukkan nama guru.', 'error'); return; }
+  const btn = e.target.closest('button');
+  btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+  callAPI('addExtraTeacher', { name, short })
+    .then(function(res) {
+      btn.disabled = false; btn.innerHTML = '<i class="fas fa-plus"></i> Tambah';
+      if (res.success) {
+        nameEl.value = ''; shortEl.value = '';
+        showAlert('✅ ' + name + ' berjaya ditambah!', 'success');
+        loadExtraTeachersAdmin();
+        loadTeachersGlobal();
+      } else { showAlert('⚠️ ' + res.message, 'error'); }
+    })
+    .catch(function(err) {
+      btn.disabled = false; btn.innerHTML = '<i class="fas fa-plus"></i> Tambah';
+      showAlert('Ralat: ' + err.message, 'error');
+    });
+}
+
+function deleteExtraTeacherAction(id) {
+  showConfirm({
+    title: 'Padam Guru Tambahan',
+    msg: 'Padam guru ini dari senarai tambahan? Tindakan ini tidak boleh dibatalkan.',
+    okLabel: 'Ya, Padam',
+    okType: 'danger',
+    icon: 'trash',
+    onOk: () => {
+      callAPI('deleteExtraTeacher', id)
+        .then(res => {
+          if (res.success) { showAlert('Guru berjaya dipadam.', 'success'); loadExtraTeachersAdmin(); loadTeachersGlobal(); }
+          else { showAlert('Gagal padam: ' + res.message, 'error'); }
+        })
+        .catch(err => showAlert('Ralat: ' + err.message, 'error'));
+    }
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ADMIN — XML UPLOAD
+   ═══════════════════════════════════════════════════════════ */
+document.getElementById('xmlFile').addEventListener('change', function(e) {
+  const file = e.target.files[0]; if (!file) return;
+  if (!file.name.endsWith('.xml')) {
+    showAlert('Sila pilih fail .xml sahaja.', 'warn');
+    e.target.value = ''; return;
+  }
+  document.getElementById('upload-ui').classList.add('hidden');
+  document.getElementById('setup-loading').classList.remove('hidden');
+  document.getElementById('setup-msg').textContent = '';
+  const reader = new FileReader();
+  reader.onload = function(ev) {
+    callAPI('processASCXML', ev.target.result)
+      .then(res => {
+        document.getElementById('setup-loading').classList.add('hidden');
+        document.getElementById('upload-ui').classList.remove('hidden');
+        const m = document.getElementById('setup-msg');
+        m.textContent = res.message;
+        m.style.color = res.success ? 'var(--success)' : 'var(--danger)';
+        if (res.success) { loadTeachersGlobal(); }
+        document.getElementById('xmlFile').value = '';
+      })
+      .catch(err => {
+        document.getElementById('setup-loading').classList.add('hidden');
+        document.getElementById('upload-ui').classList.remove('hidden');
+        document.getElementById('xmlFile').value = '';
+        const m = document.getElementById('setup-msg');
+        m.textContent = 'Ralat: ' + (err.message || err.toString());
+        m.style.color = 'var(--danger)';
+        showAlert('Upload gagal: ' + (err.message || 'Ralat tidak diketahui'), 'error');
+      });
+  };
+  reader.onerror = function() {
+    document.getElementById('setup-loading').classList.add('hidden');
+    document.getElementById('upload-ui').classList.remove('hidden');
+    showAlert('Gagal membaca fail. Cuba semula.', 'error');
+  };
+  reader.readAsText(file);
+});
+
+/* ═══════════════════════════════════════════════════════════
+   UTILITIES
+   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════
+   PRINT HELPER — detect device, buka tab baru (desktop) atau
+   modal in-page (Android / tablet) untuk paparan print
+   ═══════════════════════════════════════════════════════════ */
+function _openPrint(html, title) {
+  const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
+  if (!isMobile) {
+    // Desktop (Windows/Mac/Linux) — tab baru seperti biasa
+    const w = window.open('', '_blank', 'width=1200,height=800');
+    if (!w) {
+      // Fallback jika popup disekat
+      _showPrintModal(html, title);
+      return;
+    }
+    w.document.write(html);
+    w.document.close();
+    w.focus();
+  } else {
+    // Android / iOS — modal in-page (popup disekat)
+    _showPrintModal(html, title);
+  }
+}
+
+function _showPrintModal(htmlContent, title) {
+  let overlay = document.getElementById('print-modal-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'print-modal-overlay';
+    document.body.appendChild(overlay);
+  }
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.8);display:flex;flex-direction:column;';
+
+  overlay.innerHTML = `
+    <div style="background:#0f2044;padding:11px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-shrink:0;">
+      <div style="color:white;font-weight:800;font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;">${title}</div>
+      <div style="display:flex;gap:8px;flex-shrink:0;">
+        <button id="pm-print-btn"
+          style="padding:8px 14px;background:#059669;color:white;border:none;border-radius:8px;font-size:.78rem;font-weight:800;cursor:pointer;font-family:sans-serif;display:flex;align-items:center;gap:6px;">
+          🖨️ Print / PDF
+        </button>
+        <button onclick="document.getElementById('print-modal-overlay').style.display='none';"
+          style="padding:8px 12px;background:rgba(255,255,255,.15);color:white;border:none;border-radius:8px;font-size:.78rem;font-weight:700;cursor:pointer;font-family:sans-serif;">
+          ✕ Tutup
+        </button>
+      </div>
+    </div>
+    <div style="flex:1;overflow:hidden;background:#e5e7eb;">
+      <iframe id="print-modal-iframe" style="width:100%;height:100%;border:none;background:white;" title="Print Preview"></iframe>
+    </div>
+    <div style="background:#1e2d4a;padding:7px 14px;font-size:.62rem;color:#94a3b8;text-align:center;flex-shrink:0;">
+      Tip: Tekan <strong style="color:#d1d5db;">Print / PDF</strong> → pilih <strong style="color:#d1d5db;">Simpan sebagai PDF</strong> untuk simpan fail.
+    </div>
+  `;
+
+  overlay.style.display = 'flex';
+
+  // Tulis HTML ke dalam iframe
+  const iframe = document.getElementById('print-modal-iframe');
+  const doc = iframe.contentDocument || iframe.contentWindow.document;
+  doc.open();
+  doc.write(htmlContent);
+  doc.close();
+
+  // Pasang listener butang print selepas iframe wujud
+  document.getElementById('pm-print-btn').addEventListener('click', function() {
+    try {
+      iframe.contentWindow.focus();
+      iframe.contentWindow.print();
+    } catch(e) {
+      showAlert('Fungsi print tidak tersedia. Sila screenshot atau gunakan butang Share pada browser anda.', 'warn');
+    }
+  });
+}
+
+function escHtml(str) {
+  return String(str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function escJs(str) {
+  return String(str||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"');
+}
+
+function showAlert(msg, type = 'info') {
+  const ex = document.getElementById('sys-alert'); if (ex) ex.remove();
+  const clsMap  = {info:'alert-info', warn:'alert-warn', error:'alert-error', success:'alert-success'};
+  const iconMap  = {info:'fas fa-info-circle', warn:'fas fa-exclamation-triangle', error:'fas fa-times-circle', success:'fas fa-check-circle'};
+  const el = document.createElement('div'); el.id = 'sys-alert';
+  el.className = `alert ${clsMap[type]||'alert-info'} fade-in`;
+  el.innerHTML = `<i class="${iconMap[type]||'fas fa-info-circle'}"></i><span style="flex:1;">${msg}</span><button class="alert-close" onclick="this.parentElement.remove()">×</button>`;
+  document.body.appendChild(el);
+  setTimeout(() => { if (el.parentNode) el.remove(); }, 6000);
+}
+</script>
+
+</body>
+</html><!DOCTYPE html>
+<html lang="ms">
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <meta charset="UTF-8">
+  <title>K-SpeEdS | SK Pendidikan Khas Kuantan</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#1a3580">
+  <link rel="icon" type="image/png" href="/icon-192.png">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <!-- html2pdf.js — jana PDF terus dalam browser, TIDAK perlukan Google Drive API -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+
+  <style>
+    :root {
+      --navy:#0f2044; --navy-mid:#1a3260; --navy-light:#243d75;
+      --teal:#0ea5c9; --teal-light:#38bdf8;
+      --surface:#f0f4fa; --border:#dde4f0; --text:#1e2d4a; --muted:#6b7c9e;
+      --danger:#dc2626; --danger-light:#fef2f2; --danger-border:#fecaca;
+      --success:#059669; --success-light:#f0fdf4; --success-border:#86efac;
+      --warn:#d97706; --warn-light:#fffbeb; --warn-border:#fde68a;
+      --purple:#7c3aed; --purple-light:#f5f3ff; --purple-border:#c4b5fd;
+      --fs-xs:.75rem; --fs-sm:.875rem; --fs-base:1rem; --fs-lg:1.125rem;
+      --tap:52px; --radius:14px; --gap:14px;
+    }
+
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{font-family:'Plus Jakarta Sans',sans-serif;background:var(--surface);color:var(--text);min-height:100vh;font-size:var(--fs-base);-webkit-text-size-adjust:100%;}
+
+    /* ── NAVBAR ── */
+    .navbar{background:linear-gradient(135deg,var(--navy) 0%,var(--navy-mid) 100%);box-shadow:0 3px 16px rgba(15,32,68,.35);position:sticky;top:0;z-index:100;}
+    .navbar-inner{padding:0 16px;height:60px;display:flex;align-items:center;justify-content:space-between;gap:12px;max-width:1200px;margin:0 auto;}
+    .navbar-brand{display:flex;align-items:center;gap:11px;min-width:0;flex:1;}
+    .navbar-logo{width:36px;height:36px;flex-shrink:0;border-radius:8px;object-fit:contain;background:white;padding:2px;}
+    .navbar-icon{width:36px;height:36px;flex-shrink:0;background:rgba(14,165,201,.22);border:1px solid rgba(14,165,201,.38);border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--teal-light);font-size:15px;}
+    .navbar-text .navbar-title{color:white;font-weight:800;font-size:.78rem;letter-spacing:.02em;}
+    .navbar-text .navbar-sub{color:rgba(255,255,255,.45);font-size:.62rem;font-weight:500;}
+    .navbar-date{color:rgba(255,255,255,.9);font-size:.65rem;font-family:'JetBrains Mono',monospace;background:rgba(255,255,255,.12);padding:5px 10px;border-radius:20px;border:1px solid rgba(255,255,255,.16);white-space:nowrap;flex-shrink:0;line-height:1.5;}
+
+    /* ── TABS ── */
+    .tab-bar{background:white;border-bottom:2px solid var(--border);position:sticky;top:60px;z-index:90;}
+    .tab-bar-inner{display:flex;max-width:1200px;margin:0 auto;}
+    .tab-btn{flex:1;padding:0 8px;height:50px;font-size:.78rem;font-weight:700;color:var(--muted);border:none;border-bottom:3px solid transparent;background:none;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:7px;transition:all .2s;white-space:nowrap;-webkit-tap-highlight-color:transparent;font-family:'Plus Jakarta Sans',sans-serif;}
+    .tab-btn i{font-size:.9rem;}
+    .tab-btn:active{background:#f0f7ff;}
+    .tab-btn.active{color:var(--navy);border-bottom-color:var(--teal);background:#f5f8ff;}
+
+    /* ── MAIN LAYOUT ── */
+    .main{max-width:1200px;margin:0 auto;padding:16px 14px 60px;}
+
+    /* ── CARDS ── */
+    .card{background:white;border-radius:var(--radius);border:1.5px solid var(--border);box-shadow:0 2px 12px rgba(15,32,68,.06);overflow:hidden;margin-bottom:var(--gap);}
+    .card-head{padding:13px 16px;border-bottom:1.5px solid var(--border);background:linear-gradient(to right,#f5f8ff,white);display:flex;align-items:center;gap:11px;}
+    .card-head-icon{width:36px;height:36px;background:linear-gradient(135deg,var(--teal),#0284c7);border-radius:9px;display:flex;align-items:center;justify-content:center;color:white;font-size:.9rem;flex-shrink:0;}
+    .card-head-title{font-size:var(--fs-sm);font-weight:800;color:var(--navy);}
+    .card-head-sub{font-size:.68rem;color:var(--muted);margin-top:1px;}
+    .card-body{padding:16px;}
+
+    /* ── FIELDS ── */
+    .field-label{display:flex;align-items:center;gap:7px;font-size:var(--fs-xs);font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px;}
+    .field-label i{color:var(--teal);}
+    .input-field{width:100%;height:var(--tap);padding:0 16px;border:2px solid var(--border);border-radius:12px;font-size:var(--fs-base);font-family:'Plus Jakarta Sans',sans-serif;color:var(--text);background:#fafbfe;transition:all .2s;outline:none;-webkit-appearance:none;appearance:none;}
+    .input-field:focus{border-color:var(--teal);background:white;box-shadow:0 0 0 4px rgba(14,165,201,.12);}
+
+    /* ── BUTTONS ── */
+    .btn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;height:var(--tap);padding:0 18px;border-radius:12px;font-size:var(--fs-sm);font-weight:800;cursor:pointer;transition:all .2s;border:none;letter-spacing:.01em;-webkit-tap-highlight-color:transparent;font-family:'Plus Jakarta Sans',sans-serif;}
+    .btn:disabled{opacity:.5;cursor:not-allowed;}
+    .btn:active:not(:disabled){transform:scale(.97);}
+    .btn-primary{background:linear-gradient(135deg,var(--navy-light),var(--navy));color:white;box-shadow:0 4px 16px rgba(15,32,68,.25);}
+    .btn-success{background:linear-gradient(135deg,#059669,#047857);color:white;box-shadow:0 4px 14px rgba(5,150,105,.25);}
+    .btn-danger{background:linear-gradient(135deg,#dc2626,#b91c1c);color:white;box-shadow:0 3px 12px rgba(220,38,38,.22);}
+    .btn-secondary{background:#eef2ff;color:var(--navy);border:2px solid var(--border);}
+    .btn-ghost{width:auto;height:40px;padding:0 12px;background:#f0f4fa;color:var(--muted);border-radius:9px;border:1.5px solid var(--border);display:inline-flex;align-items:center;justify-content:center;gap:6px;font-size:var(--fs-xs);font-weight:700;font-family:'Plus Jakarta Sans',sans-serif;cursor:pointer;transition:all .15s;}
+    .btn-ghost:active{background:#e5ebf8;color:var(--navy);}
+    .btn-sm{height:38px;padding:0 13px;font-size:var(--fs-xs);width:auto;border-radius:9px;flex-shrink:0;}
+    .btn-inline{width:auto;flex-shrink:0;}
+    .btn-confirm{background:linear-gradient(135deg,#7c3aed,#6d28d9);color:white;box-shadow:0 4px 14px rgba(124,58,237,.25);}
+
+    /* ── STATUS CHIPS ── */
+    .chip{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:.68rem;font-weight:700;}
+    .chip-draft{background:#fef3c7;color:#92400e;border:1.5px solid #fde68a;}
+    .chip-confirmed{background:#dcfce7;color:#166534;border:1.5px solid #86efac;}
+    .chip-empty{background:#f0f4fa;color:var(--muted);border:1.5px solid var(--border);}
+
+    /* ── ALERT ── */
+    .alert{padding:12px 14px;border-radius:11px;font-size:var(--fs-sm);font-weight:500;display:flex;gap:10px;align-items:flex-start;position:fixed;top:70px;left:12px;right:12px;z-index:999;box-shadow:0 8px 28px rgba(0,0,0,.14);max-width:680px;margin:0 auto;}
+    .alert-info{background:#eff6ff;border:1.5px solid #bfdbfe;color:#1d4ed8;}
+    .alert-warn{background:#fffbeb;border:1.5px solid #fde68a;color:#92400e;}
+    .alert-error{background:#fff1f2;border:1.5px solid #fecaca;color:#9f1239;}
+    .alert-success{background:#f0fdf4;border:1.5px solid #86efac;color:#166534;}
+    .alert i{flex-shrink:0;margin-top:1px;}
+    .alert-close{margin-left:auto;background:none;border:none;cursor:pointer;color:currentColor;font-size:1.1rem;padding:0;flex-shrink:0;}
+
+    /* ── STATES ── */
+    .state-box{text-align:center;padding:48px 20px;background:white;border-radius:var(--radius);border:1.5px solid var(--border);}
+    .spinner{width:40px;height:40px;border-radius:50%;border:3px solid var(--border);border-top-color:var(--teal);animation:spin .8s linear infinite;margin:0 auto 14px;}
+    @keyframes spin{to{transform:rotate(360deg);}}
+    .state-icon{width:60px;height:60px;border-radius:16px;background:#f0f4fa;display:flex;align-items:center;justify-content:center;margin:0 auto 14px;font-size:1.5rem;color:var(--muted);}
+    .state-title{font-weight:800;color:var(--navy);font-size:var(--fs-base);margin-bottom:5px;}
+    .state-sub{font-size:var(--fs-sm);color:var(--muted);}
+
+    /* ── MODAL ── */
+    .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:200;display:flex;align-items:flex-end;justify-content:center;}
+    .modal-box{background:white;width:100%;max-width:680px;max-height:92vh;display:flex;flex-direction:column;border-radius:22px 22px 0 0;overflow:hidden;box-shadow:0 -8px 40px rgba(0,0,0,.28);}
+    .modal-handle{width:38px;height:4px;background:var(--border);border-radius:4px;margin:10px auto 0;}
+    .modal-head{padding:13px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0;}
+    .modal-title{font-size:var(--fs-base);font-weight:800;color:var(--navy);display:flex;align-items:center;gap:8px;}
+    .modal-close{width:42px;height:42px;border-radius:9px;background:#f0f4fa;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:1.1rem;flex-shrink:0;}
+    .modal-body{padding:14px;overflow-y:auto;background:var(--surface);flex:1;-webkit-overflow-scrolling:touch;}
+    .modal-foot{padding:11px 14px;border-top:1px solid var(--border);background:white;flex-shrink:0;display:flex;gap:10px;}
+
+    /* ── TAPAK HARIAN HEADER ── */
+    .board-header{background:linear-gradient(135deg,var(--navy) 0%,var(--navy-mid) 100%);border-radius:var(--radius);padding:18px 20px;margin-bottom:var(--gap);color:white;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;}
+    .board-header-left{display:flex;align-items:center;gap:14px;}
+    .board-date-badge{background:rgba(255,255,255,.14);border:1.5px solid rgba(255,255,255,.22);border-radius:12px;padding:10px 16px;text-align:center;}
+    .board-date-day{font-size:.68rem;font-weight:700;color:rgba(255,255,255,.6);text-transform:uppercase;letter-spacing:.08em;}
+    .board-date-num{font-size:1.6rem;font-weight:900;font-family:'JetBrains Mono',monospace;color:white;line-height:1;}
+    .board-date-month{font-size:.72rem;font-weight:600;color:rgba(255,255,255,.7);}
+    .board-info{flex:1;}
+    .board-title{font-size:.85rem;font-weight:700;color:rgba(255,255,255,.65);text-transform:uppercase;letter-spacing:.06em;}
+    .board-subtitle{font-size:1.1rem;font-weight:900;color:white;margin-top:2px;}
+    .board-actions{display:flex;gap:8px;flex-wrap:wrap;}
+
+    /* ── ABSENT TEACHER TAGS ── */
+    .absent-panel{background:white;border-radius:var(--radius);border:1.5px solid var(--border);padding:14px 16px;margin-bottom:var(--gap);}
+    .absent-panel-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;gap:10px;}
+    .absent-panel-title{font-size:var(--fs-sm);font-weight:800;color:var(--navy);display:flex;align-items:center;gap:8px;}
+    .absent-panel-title i{color:var(--danger);}
+    .absent-tags{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;}
+    .absent-tag{display:inline-flex;align-items:center;gap:8px;background:var(--danger-light);border:1.5px solid var(--danger-border);border-radius:30px;padding:7px 12px;font-size:var(--fs-xs);font-weight:700;color:var(--danger);max-width:100%;}
+    .absent-tag-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .absent-tag-remove{width:22px;height:22px;border-radius:50%;background:rgba(220,38,38,.15);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--danger);font-size:.7rem;flex-shrink:0;transition:all .15s;}
+    .absent-tag-remove:active{background:var(--danger);color:white;}
+    .absent-empty{font-size:var(--fs-sm);color:var(--muted);font-style:italic;padding:8px 0;}
+    /* Fix: select + butang dalam satu baris, butang tak lari */
+    .absent-add-row{display:flex;gap:8px;align-items:center;width:100%;}
+    .absent-select{flex:1;min-width:0;height:48px;padding:0 12px;border:2px solid var(--border);border-radius:10px;font-size:var(--fs-sm);font-family:'Plus Jakarta Sans',sans-serif;color:var(--text);background:#fafbfe;outline:none;cursor:pointer;-webkit-appearance:none;appearance:none;}
+    .absent-select:focus{border-color:var(--teal);}
+    .absent-reason-badge{display:inline-flex;align-items:center;flex-shrink:0;padding:2px 8px;border-radius:20px;font-size:.62rem;font-weight:800;cursor:pointer;white-space:nowrap;border:1.5px solid transparent;}
+    .reason-pick-btn{display:block;width:100%;text-align:left;padding:13px 14px;margin-bottom:8px;border-radius:10px;border:2px solid var(--border);background:#fafbfe;color:var(--text);font-weight:700;font-size:.9rem;cursor:pointer;font-family:'Plus Jakarta Sans',sans-serif;}
+    .reason-pick-btn:active{transform:scale(.98);}
+    .btn-tambah{height:48px;padding:0 16px;background:linear-gradient(135deg,var(--danger),#b91c1c);color:white;border:none;border-radius:10px;font-size:var(--fs-sm);font-weight:800;cursor:pointer;display:flex;align-items:center;gap:7px;white-space:nowrap;flex-shrink:0;font-family:'Plus Jakarta Sans',sans-serif;-webkit-tap-highlight-color:transparent;transition:all .2s;}
+    .btn-tambah:active{transform:scale(.96);}
+
+    /* ── JADUAL VISUAL GRID ── */
+    .timetable-wrap{background:white;border-radius:var(--radius);border:1.5px solid var(--border);overflow:hidden;margin-bottom:var(--gap);}
+    .timetable-toolbar{padding:12px 16px;border-bottom:1.5px solid var(--border);display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:linear-gradient(to right,#f5f8ff,white);}
+    .timetable-title{font-size:var(--fs-sm);font-weight:800;color:var(--navy);display:flex;align-items:center;gap:8px;flex:1;}
+    .timetable-legend{display:flex;gap:8px;flex-wrap:wrap;}
+    .legend-item{display:flex;align-items:center;gap:5px;font-size:.62rem;font-weight:700;color:var(--muted);}
+    .legend-dot{width:9px;height:9px;border-radius:3px;flex-shrink:0;}
+    .btn-print-jadual{height:36px;padding:0 14px;background:linear-gradient(135deg,var(--navy-light),var(--navy));color:white;border:none;border-radius:9px;font-size:.72rem;font-weight:800;cursor:pointer;display:flex;align-items:center;gap:6px;white-space:nowrap;flex-shrink:0;font-family:'Plus Jakarta Sans',sans-serif;-webkit-tap-highlight-color:transparent;transition:all .15s;box-shadow:0 2px 8px rgba(15,32,68,.2);}
+    .btn-print-jadual:hover{background:linear-gradient(135deg,#2d4a8a,var(--navy-mid));}
+    .btn-print-jadual:active{transform:scale(.96);}
+
+    /* Scroll container — penting: overflow-x scroll, jangan overflow hidden */
+    .timetable-scroll{overflow-x:auto;overflow-y:visible;-webkit-overflow-scrolling:touch;width:100%;}
+    .timetable-scroll::-webkit-scrollbar{height:6px;}
+    .timetable-scroll::-webkit-scrollbar-track{background:#f0f4fa;}
+    .timetable-scroll::-webkit-scrollbar-thumb{background:#c7d2e8;border-radius:4px;}
+
+    /* Grid table */
+    .tt-table{border-collapse:collapse;table-layout:fixed;}
+    .tt-table th,.tt-table td{border:1px solid #e2e8f0;}
+
+    /* Sticky kolum pertama (nama guru) */
+    .tt-sticky{position:sticky;left:0;z-index:6;background:white;}
+
+    /* Header row — waktu */
+    .tt-head-row th{background:var(--navy);color:white;padding:7px 6px;text-align:center;white-space:nowrap;font-family:'JetBrains Mono',monospace;}
+    .tt-head-guru{background:var(--navy-mid) !important;font-size:.68rem;font-weight:800;min-width:110px;width:110px;padding:7px 10px !important;text-align:left !important;}
+    .tt-head-period{min-width:80px;width:80px;}
+    .tt-head-period-num{font-size:.82rem;font-weight:900;}
+    .tt-head-period-time{font-size:.56rem;color:rgba(255,255,255,.6);margin-top:1px;}
+    .tt-head-rehat{background:#374151 !important;min-width:54px;width:54px;font-size:.6rem;color:#9ca3af !important;}
+
+    /* Row guru */
+    .tt-guru-cell{background:#f8faff;padding:8px 10px;font-size:.68rem;font-weight:800;color:var(--navy);min-width:110px;width:110px;border-right:2px solid var(--border);vertical-align:middle;line-height:1.3;}
+    .tt-guru-absent{background:var(--danger-light) !important;border-right-color:var(--danger-border) !important;}
+    .tt-guru-absent .tt-guru-name{color:var(--danger);}
+    .tt-guru-name{display:block;font-size:.65rem;font-weight:800;color:var(--navy);}
+    .tt-guru-tag{display:inline-block;margin-top:3px;font-size:.55rem;font-weight:800;padding:1px 6px;border-radius:8px;background:var(--danger-light);color:var(--danger);border:1px solid var(--danger-border);}
+
+    /* Slot cell */
+    .tt-slot{height:64px;vertical-align:middle;cursor:default;}
+    .tt-slot-inner{padding:5px 6px;height:100%;display:flex;flex-direction:column;justify-content:center;gap:1px;}
+
+    /* Slot biasa — biru */
+    .tt-slot.s-normal .tt-slot-inner{background:#3b82f6;}
+    /* Slot tak hadir — belum isi, merah berkedip, boleh tap */
+    .tt-slot.s-absent{cursor:pointer;}
+    .tt-slot.s-absent .tt-slot-inner{background:var(--danger);animation:pulse-slot 2s ease-in-out infinite;}
+    /* Tak hadir — sedang diisi (ada relief tapi belum save) */
+    .tt-slot.s-partial .tt-slot-inner{background:#b45309;animation:none;}
+    /* Tak hadir — dah ada guru ganti */
+    .tt-slot.s-done .tt-slot-inner{background:var(--success);}
+    /* Slot kosong (guru tiada kelas waktu tu) */
+    .tt-slot.s-empty .tt-slot-inner{background:#f8faff;}
+    /* Rehat */
+    .tt-slot.s-rehat .tt-slot-inner{background:#f0f4fa;cursor:default;}
+
+    @keyframes pulse-slot{0%,100%{opacity:1;}50%{opacity:.78;}}
+
+    /* Teks dalam slot */
+    .tt-slot-subj{font-size:.62rem;font-weight:800;color:white;line-height:1.2;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;}
+    .tt-slot-class{font-size:.55rem;font-weight:600;color:rgba(255,255,255,.75);line-height:1.2;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
+    .tt-slot-relief{margin-top:2px;font-size:.52rem;font-weight:800;color:white;background:rgba(0,0,0,.2);border-radius:3px;padding:1px 4px;display:inline-flex;align-items:center;gap:2px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;max-width:100%;}
+    .tt-slot-add{margin-top:2px;font-size:.52rem;font-weight:800;color:rgba(255,255,255,.8);background:rgba(255,255,255,.18);border-radius:3px;padding:1px 4px;display:inline-flex;align-items:center;gap:2px;}
+    .tt-slot.s-empty .tt-slot-subj,.tt-slot.s-empty .tt-slot-class{color:transparent;}
+
+    /* Slot kosong tapi guru dah jadi relief waktu ini — OREN */
+    .tt-slot.s-relief-duty{cursor:default;}
+    .tt-slot.s-relief-duty .tt-slot-inner{background:linear-gradient(135deg,#ea580c,#c2410c);animation:pulse-relief 2.5s ease-in-out infinite;}
+    @keyframes pulse-relief{0%,100%{opacity:1;}50%{opacity:.82;}}
+    .tt-slot-duty-badge{margin-top:2px;font-size:.52rem;font-weight:800;color:white;background:rgba(0,0,0,.22);border-radius:3px;padding:1px 5px;display:inline-flex;align-items:center;gap:2px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;max-width:100%;}
+
+    /* Slot ada kelas + jadi relief (OVERRIDE) — biru + border oren tebal */
+    .tt-slot.s-override{cursor:default;outline:3px solid #ea580c;outline-offset:-3px;position:relative;}
+    .tt-slot.s-override .tt-slot-inner{background:linear-gradient(160deg,#2563eb 60%,#1d4ed8 100%);}
+    .tt-slot-override-badge{margin-top:2px;font-size:.5rem;font-weight:900;color:#fff7ed;background:#ea580c;border-radius:3px;padding:1px 5px;display:inline-flex;align-items:center;gap:2px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;max-width:100%;letter-spacing:.02em;}
+
+    /* Override section dalam modal */
+    .override-toggle{display:flex;align-items:center;gap:8px;padding:10px 14px;background:#fffbeb;border:1.5px solid #fde68a;border-radius:10px;cursor:pointer;margin-top:4px;-webkit-tap-highlight-color:transparent;transition:all .15s;}
+    .override-toggle:active{background:#fef3c7;}
+    .override-toggle-icon{width:30px;height:30px;border-radius:8px;background:#d97706;display:flex;align-items:center;justify-content:center;color:white;font-size:.75rem;flex-shrink:0;}
+    .override-toggle-text{flex:1;}
+    .override-toggle-label{font-size:.75rem;font-weight:800;color:#92400e;}
+    .override-toggle-sub{font-size:.62rem;color:#b45309;margin-top:1px;}
+    .override-toggle-chevron{font-size:.7rem;color:#d97706;transition:transform .25s;}
+    .override-toggle-chevron.open{transform:rotate(180deg);}
+    .override-list{margin-top:8px;}
+
+    /* ── LEGEND ABSENT ── */
+    .absent-stat{display:flex;gap:10px;flex-wrap:wrap;padding:10px 16px;border-top:1.5px solid var(--border);background:#fafbfe;}
+    .absent-stat-item{display:flex;align-items:center;gap:6px;font-size:.68rem;font-weight:700;}
+
+    /* ── ASSIGN MODAL ── */
+    .assign-slot-info{background:var(--navy);border-radius:12px;padding:14px 16px;margin-bottom:14px;color:white;}
+    .assign-slot-row{display:flex;gap:14px;flex-wrap:wrap;}
+    .assign-slot-item{flex:1;min-width:100px;}
+    .assign-slot-label{font-size:.62rem;font-weight:800;color:rgba(255,255,255,.55);text-transform:uppercase;letter-spacing:.07em;margin-bottom:3px;}
+    .assign-slot-value{font-size:.9rem;font-weight:800;color:white;}
+    .assign-teacher-list{display:flex;flex-direction:column;gap:8px;}
+    .assign-teacher-card{background:white;border-radius:11px;border:2px solid var(--border);padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer;transition:all .18s;}
+    .assign-teacher-card:active{transform:scale(.98);}
+    .assign-teacher-card.selected{border-color:var(--success);background:var(--success-light);}
+    .assign-teacher-card.busy-teacher{border-color:var(--danger-border);background:var(--danger-light);opacity:.75;}
+    .assign-teacher-name{font-weight:800;font-size:var(--fs-sm);color:var(--navy);flex:1;}
+    .assign-teacher-stats{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px;}
+    .assign-stat-chip{font-size:.62rem;font-weight:700;padding:2px 7px;border-radius:10px;}
+    .assign-stat-free{background:#dcfce7;color:#166534;}
+    .assign-stat-busy{background:#fee2e2;color:#991b1b;}
+    .assign-stat-relief{background:#ede9fe;color:#5b21b6;}
+    .btn-assign{background:linear-gradient(135deg,var(--success),#047857);color:white;border:none;border-radius:9px;padding:8px 16px;font-size:.78rem;font-weight:800;cursor:pointer;white-space:nowrap;flex-shrink:0;font-family:'Plus Jakarta Sans',sans-serif;transition:all .15s;}
+    .btn-assign:active{transform:scale(.96);}
+    .btn-assign.selected{background:linear-gradient(135deg,#64748b,#475569);}
+    .assign-section-title{font-size:.68rem;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin:12px 0 8px;display:flex;align-items:center;gap:6px;}
+    .assign-section-title i{color:var(--teal);}
+
+    /* ── SORT BAR ── */
+    .sort-bar{display:flex;align-items:center;gap:7px;margin-bottom:12px;flex-wrap:wrap;}
+    .sort-label{font-size:.62rem;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;}
+    .sort-btn{height:30px;padding:0 11px;border-radius:20px;font-size:.68rem;font-weight:700;border:1.5px solid var(--border);background:white;color:var(--muted);cursor:pointer;transition:all .15s;font-family:'Plus Jakarta Sans',sans-serif;}
+    .sort-btn.active{background:var(--navy);color:white;border-color:var(--navy);}
+
+    /* ── NOTA SECTION (dalam assign modal) ── */
+    .note-section{background:#f8faff;border:1.5px solid var(--border);border-radius:11px;padding:12px 14px;margin-bottom:14px;}
+    .note-label{font-size:.68rem;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;display:flex;align-items:center;gap:6px;margin-bottom:8px;}
+    .note-label i{color:var(--teal);}
+    .note-textarea{width:100%;min-height:68px;padding:10px 12px;border:2px solid var(--border);border-radius:9px;font-size:.85rem;font-family:'Plus Jakarta Sans',sans-serif;color:var(--text);background:white;resize:vertical;outline:none;line-height:1.5;transition:border-color .2s;}
+    .note-textarea:focus{border-color:var(--teal);box-shadow:0 0 0 3px rgba(14,165,201,.1);}
+    /* Ikon kecil pada slot yang ada catatan */
+    .tt-slot-note-icon{display:inline-flex;align-items:center;font-size:.48rem;margin-left:3px;opacity:.9;}
+
+    /* ── PDF OUTPUT MODAL ── */
+    .pdf-preview-area{background:#e5e7eb;border-radius:12px;padding:16px;min-height:200px;}
+    .pdf-page{background:white;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.12);margin-bottom:14px;overflow:hidden;}
+    .pdf-page-inner{padding:24px 28px;}
+
+    /* ── PRINT STYLES (untuk PDF betul) ── */
+    .pdf-content{display:none;}
+
+    /* ── ARKIB ── */
+    .archive-card{background:white;border-radius:var(--radius);border:1.5px solid var(--border);overflow:hidden;margin-bottom:14px;}
+    .archive-card-head{padding:13px 16px;background:var(--navy);color:white;display:flex;align-items:center;justify-content:space-between;gap:12px;}
+    .archive-table{width:100%;border-collapse:collapse;font-size:var(--fs-sm);}
+    .archive-table th{padding:9px 13px;background:#f8faff;font-size:.68rem;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid var(--border);text-align:left;}
+    .archive-table td{padding:11px 13px;border-bottom:1px solid #f0f4fa;vertical-align:middle;}
+    .archive-table tr:last-child td{border-bottom:none;}
+    .archive-table tr:hover td{background:#f8faff;}
+
+    /* ── ADMIN ── */
+    .admin-section{margin-bottom:var(--gap);}
+    .file-drop{border:2px dashed var(--border);border-radius:12px;padding:32px 20px;background:#fafbfe;cursor:pointer;transition:all .2s;text-align:center;}
+    .file-drop:active{border-color:var(--teal);background:#f0faff;}
+    .file-drop input{display:none;}
+
+    /* ── CHECKLIST TEACHER ── */
+    .check-box{border:2px solid var(--border);border-radius:11px;background:#fafbfe;overflow:hidden;}
+    .check-box-inner{max-height:200px;overflow-y:auto;-webkit-overflow-scrolling:touch;}
+    .check-box-inner::-webkit-scrollbar{width:4px;}
+    .check-box-inner::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
+    .check-item{display:flex;align-items:center;gap:12px;padding:12px 14px;min-height:var(--tap);cursor:pointer;border-bottom:1px solid #f0f4fa;transition:background .15s;-webkit-tap-highlight-color:transparent;}
+    .check-item:last-child{border-bottom:none;}
+    .check-item:active{background:#eef4ff;}
+    .check-item input[type=checkbox]{width:20px;height:20px;flex-shrink:0;accent-color:var(--teal);cursor:pointer;}
+    .check-label{font-size:var(--fs-sm);font-weight:600;color:var(--text);flex:1;line-height:1.4;}
+
+    /* ── CUSTOM CONFIRM MODAL ── */
+    .confirm-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:500;display:flex;align-items:center;justify-content:center;padding:20px;}
+    .confirm-box{background:white;border-radius:20px;width:100%;max-width:360px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.3);animation:confirmPop .2s cubic-bezier(.34,1.56,.64,1) forwards;}
+    @keyframes confirmPop{from{opacity:0;transform:scale(.88);}to{opacity:1;transform:scale(1);}}
+    .confirm-icon-wrap{padding:28px 24px 16px;text-align:center;}
+    .confirm-icon{width:56px;height:56px;border-radius:16px;display:flex;align-items:center;justify-content:center;margin:0 auto 14px;font-size:1.4rem;}
+    .confirm-icon-danger{background:#fef2f2;color:#dc2626;}
+    .confirm-icon-warn{background:#fffbeb;color:#d97706;}
+    .confirm-icon-info{background:#eff6ff;color:#2563eb;}
+    .confirm-title{font-size:1rem;font-weight:900;color:var(--navy);margin-bottom:8px;}
+    .confirm-msg{font-size:.85rem;color:var(--muted);line-height:1.55;}
+    .confirm-foot{display:flex;border-top:1.5px solid var(--border);}
+    .confirm-btn{flex:1;height:52px;border:none;font-size:.9rem;font-weight:800;cursor:pointer;font-family:'Plus Jakarta Sans',sans-serif;transition:all .15s;-webkit-tap-highlight-color:transparent;}
+    .confirm-btn:active{opacity:.8;}
+    .confirm-btn-cancel{background:white;color:var(--muted);border-right:1.5px solid var(--border);}
+    .confirm-btn-ok{background:white;color:var(--danger);}
+    .confirm-btn-ok.warn{color:var(--warn);}
+    .confirm-btn-ok.primary{color:var(--navy);}
+    .confirm-btn-cancel:active{background:#f0f4fa;}
+    .confirm-btn-ok:active{background:#fef2f2;}
+    .hidden{display:none!important;}
+    .fade-in{animation:fadeSlide .3s ease forwards;}
+    @keyframes fadeSlide{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:translateY(0);}}
+    .divider{height:1px;background:var(--border);margin:12px 0;}
+    .text-muted{color:var(--muted);font-size:var(--fs-sm);}
+    .flex-row{display:flex;align-items:center;gap:10px;}
+    .flex-1{flex:1;}
+    .mt-2{margin-top:8px;}
+    .mt-3{margin-top:14px;}
+
+    /* Responsive */
+    @media(max-width:600px){
+      .board-header{padding:14px;}
+      .board-actions .btn{font-size:.72rem;padding:0 12px;}
+    }
+  </style>
+</head>
+<body>
+
+<!-- NAVBAR -->
+<nav class="navbar">
+  <div class="navbar-inner">
+    <div class="navbar-brand">
+      <img id="navbar-logo-img" class="navbar-logo school-logo-img" alt="Logo" src="" style="display:none;" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+      <div class="navbar-icon" id="navbar-icon-fallback" style="display:none;"><i class="fas fa-chalkboard-teacher"></i></div>
+      <div class="navbar-text">
+        <div class="navbar-title">SK PENDIDIKAN KHAS KUANTAN</div>
+        <div class="navbar-sub">Sistem Pengurusan Guru Ganti · v4.6</div>
+      </div>
+    </div>
+    <div class="navbar-date" id="current-date-display">...</div>
+  </div>
+</nav>
+
+<!-- TABS -->
+<div class="tab-bar">
+  <div class="tab-bar-inner">
+    <button class="tab-btn active" id="tab-daily" onclick="switchTab('daily')"><i class="fas fa-calendar-day"></i> Tapak Harian</button>
+    <button class="tab-btn" id="tab-history" onclick="switchTab('history')"><i class="fas fa-archive"></i> Arkib</button>
+    <button class="tab-btn" id="tab-admin" onclick="switchTab('admin')"><i class="fas fa-cog"></i> Admin</button>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- ═══════════════════════════════════════
+       TAB 1: TAPAK HARIAN
+       ═══════════════════════════════════════ -->
+  <div id="view-daily" class="fade-in">
+
+    <!-- Pilih Tarikh -->
+    <div class="card">
+      <div class="card-head">
+        <div class="card-head-icon"><i class="fas fa-calendar"></i></div>
+        <div class="flex-1">
+          <div class="card-head-title">Pilih Tarikh</div>
+          <div class="card-head-sub">Buka atau cipta tapak harian</div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="flex-row">
+          <input type="date" id="boardDate" class="input-field flex-1">
+          <button onclick="loadBoard()" class="btn btn-primary btn-sm btn-inline" style="height:var(--tap);">
+            <i class="fas fa-folder-open"></i> Buka Tapak
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Loading state -->
+    <div id="board-loading" class="hidden state-box" style="margin-bottom:var(--gap);">
+      <div class="spinner"></div>
+      <div class="state-title">Memuatkan tapak harian...</div>
+    </div>
+
+    <!-- Board content (empty by default) -->
+    <div id="board-content" class="hidden fade-in">
+
+      <!-- Board Header -->
+      <div class="board-header" id="board-header-bar">
+        <div class="board-header-left">
+          <div class="board-date-badge">
+            <div class="board-date-day" id="bh-dayname">—</div>
+            <div class="board-date-num" id="bh-datenum">—</div>
+            <div class="board-date-month" id="bh-month">—</div>
+          </div>
+          <div class="board-info">
+            <div class="board-title">Tapak Harian Guru Ganti</div>
+            <div class="board-subtitle" id="bh-title">Tiada guru tidak hadir</div>
+          </div>
+        </div>
+        <div class="board-actions">
+          <span id="bh-status-chip" class="chip chip-draft">
+            <i class="fas fa-pencil-alt"></i> Draft
+          </span>
+          <button onclick="confirmBoard()" class="btn btn-confirm btn-sm" id="btn-confirm-board">
+            <i class="fas fa-check-circle"></i> Sahkan & Simpan
+          </button>
+          <button onclick="generatePDF()" class="btn btn-success btn-sm" id="btn-gen-pdf">
+            <i class="fas fa-file-pdf"></i> Jana PDF
+          </button>
+          <button onclick="emailJadualGuruGanti()" class="btn btn-secondary btn-sm" id="btn-email-pdf">
+            <i class="fas fa-envelope"></i> Hantar Emel
+          </button>
+        </div>
+      </div>
+
+      <!-- Panel Guru Tak Hadir -->
+      <div class="absent-panel">
+        <div class="absent-panel-head">
+          <div class="absent-panel-title">
+            <i class="fas fa-user-times"></i> Guru Tidak Hadir
+          </div>
+          <span id="absent-count-chip" class="chip chip-empty">0 orang</span>
+        </div>
+        <div id="absent-tags-container" class="absent-tags">
+          <span class="absent-empty">Tiada guru ditanda tidak hadir.</span>
+        </div>
+        <div class="absent-add-row">
+          <select id="absent-select" class="absent-select">
+            <option value="">— Pilih guru untuk tambah —</option>
+          </select>
+        </div>
+        <div class="absent-add-row" style="margin-top:8px;">
+          <select id="absent-reason-select" class="absent-select">
+            <option value="">— Pilih sebab —</option>
+            <option value="Urusan Rasmi">Urusan Rasmi</option>
+            <option value="Cuti">Cuti</option>
+            <option value="Keluar Waktu Bekerja">Keluar Waktu Bekerja</option>
+          </select>
+          <button onclick="addAbsent()" class="btn-tambah">
+            <i class="fas fa-plus"></i> Tambah
+          </button>
+        </div>
+      </div>
+
+      <!-- Jadual Visual Induk -->
+      <div class="timetable-wrap" id="timetable-wrap">
+        <div class="timetable-toolbar">
+          <div class="timetable-title">
+            <i class="fas fa-th" style="color:var(--teal);"></i>
+            Jadual Induk Harian
+          </div>
+          <div class="timetable-legend">
+            <div class="legend-item"><div class="legend-dot" style="background:#3b82f6;"></div>Biasa</div>
+            <div class="legend-item"><div class="legend-dot" style="background:var(--danger);"></div>Tak Hadir</div>
+            <div class="legend-item"><div class="legend-dot" style="background:var(--success);"></div>Dah Isi</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#ea580c;"></div>Sedang Relief</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#2563eb;outline:2px solid #ea580c;outline-offset:1px;"></div>Override</div>
+          </div>
+        </div>
+        <div class="timetable-scroll">
+          <div id="timetable-container">
+            <div class="state-box" style="border-radius:0;border:none;">
+              <div class="state-icon"><i class="fas fa-table"></i></div>
+              <div class="state-title">Jadual Kosong</div>
+              <div class="state-sub">Tandakan guru tidak hadir untuk lihat jadual</div>
+            </div>
+          </div>
+        </div>
+        <div class="absent-stat" id="slot-stat-bar" style="display:none;">
+          <div class="absent-stat-item">
+            <div class="legend-dot" style="background:var(--danger);border-radius:50%;width:10px;height:10px;"></div>
+            <span id="stat-pending">0 slot belum isi</span>
+          </div>
+          <div class="absent-stat-item">
+            <div class="legend-dot" style="background:var(--success);border-radius:50%;width:10px;height:10px;"></div>
+            <span id="stat-done">0 slot dah isi</span>
+          </div>
+          <div class="absent-stat-item">
+            <div class="legend-dot" style="background:#3b82f6;border-radius:50%;width:10px;height:10px;"></div>
+            <span id="stat-normal">0 slot biasa</span>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /board-content -->
+
+    <!-- Empty state sebelum pilih tarikh -->
+    <div id="board-empty" class="state-box">
+      <div class="state-icon"><i class="fas fa-calendar-plus"></i></div>
+      <div class="state-title">Pilih Tarikh</div>
+      <div class="state-sub">Pilih tarikh di atas untuk buka atau cipta tapak harian</div>
+    </div>
+
+  </div><!-- /view-daily -->
+
+
+  <!-- ═══════════════════════════════════════
+       TAB 2: ARKIB
+       ═══════════════════════════════════════ -->
+  <div id="view-history" class="hidden fade-in">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-head-icon" style="background:linear-gradient(135deg,#6b7280,#374151);"><i class="fas fa-archive"></i></div>
+        <div>
+          <div class="card-head-title">Cari Rekod Lampau</div>
+          <div class="card-head-sub">Pilih tarikh untuk buka arkib</div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="flex-row">
+          <input type="date" id="historyDate" class="input-field flex-1">
+          <button onclick="loadHistory()" class="btn btn-primary btn-sm btn-inline" style="height:var(--tap);">
+            <i class="fas fa-folder-open"></i> Buka Arkib
+          </button>
+        </div>
+      </div>
+    </div>
+    <div id="history-content" class="hidden fade-in">
+      <div class="flex-row" style="margin-bottom:var(--gap);">
+        <div class="flex-1">
+          <div style="font-size:var(--fs-base);font-weight:800;color:var(--navy);">Rekod Arkib</div>
+          <div style="font-size:var(--fs-xs);color:var(--muted);" id="history-date-label"></div>
+        </div>
+        <button onclick="printArchive()" class="btn btn-success btn-sm">
+          <i class="fas fa-file-pdf"></i> Jana PDF
+        </button>
+        <button onclick="emailArchivePDF()" class="btn btn-secondary btn-sm" id="btn-email-archive">
+          <i class="fas fa-envelope"></i> Hantar Emel
+        </button>
+      </div>
+      <div id="history-container"></div>
+    </div>
+  </div>
+
+
+  <!-- ═══════════════════════════════════════
+       TAB 3: ADMIN
+       ═══════════════════════════════════════ -->
+  <div id="view-admin" class="hidden fade-in">
+
+    <!-- ── Print Jadual Induk ── -->
+    <div class="card admin-section">
+      <div class="card-head">
+        <div class="card-head-icon" style="background:linear-gradient(135deg,#1e40af,#1d4ed8);"><i class="fas fa-print"></i></div>
+        <div>
+          <div class="card-head-title">Print Jadual Induk</div>
+          <div class="card-head-sub">Cetak jadual waktu asal guru mengikut hari</div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+          <div style="flex:1;min-width:160px;">
+            <label style="font-size:.72rem;font-weight:800;color:var(--muted);display:block;margin-bottom:6px;">PILIH HARI</label>
+            <select id="print-day-select" style="width:100%;height:40px;border:1.5px solid var(--border);border-radius:10px;padding:0 12px;font-size:.8rem;font-weight:700;color:var(--navy);background:white;font-family:'Plus Jakarta Sans',sans-serif;cursor:pointer;outline:none;">
+              <option value="1">Isnin</option>
+              <option value="2">Selasa</option>
+              <option value="3">Rabu</option>
+              <option value="4">Khamis</option>
+              <option value="5">Jumaat</option>
+            </select>
+          </div>
+          <div style="padding-top:18px;">
+            <button onclick="printJadualIndukByDay()" class="btn-print-jadual" style="height:40px;padding:0 20px;font-size:.8rem;">
+              <i class="fas fa-print"></i> Print / Simpan PDF
+            </button>
+          </div>
+        </div>
+        <div style="margin-top:10px;font-size:.7rem;color:var(--muted);line-height:1.6;">
+          <i class="fas fa-info-circle" style="color:var(--teal);margin-right:4px;"></i>
+          Jadual yang dicetak adalah jadual waktu <strong>asal</strong> — tiada kaitan dengan kehadiran atau guru ganti.
+          Pastikan data XML telah dimuat naik sebelum mencetak.
+        </div>
+      </div>
+    </div>
+
+    <!-- Muat Naik XML -->
+    <div class="card admin-section">
+      <div class="card-head">
+        <div class="card-head-icon"><i class="fas fa-file-upload"></i></div>
+        <div><div class="card-head-title">Muat Naik Jadual ASC</div><div class="card-head-sub">Fail .xml daripada aSc Timetables</div></div>
+      </div>
+      <div class="card-body">
+        <div id="upload-ui">
+          <div class="file-drop" onclick="document.getElementById('xmlFile').click()">
+            <input type="file" id="xmlFile" accept=".xml">
+            <i class="fas fa-cloud-upload-alt" style="font-size:2rem;color:var(--teal);display:block;margin-bottom:12px;"></i>
+            <div style="font-weight:800;color:var(--navy);font-size:var(--fs-base);margin-bottom:4px;">Ketik untuk pilih fail XML</div>
+            <div style="color:var(--muted);font-size:var(--fs-xs);">Hanya fail .xml diterima</div>
+          </div>
+        </div>
+        <div id="setup-loading" class="hidden" style="margin-top:16px;text-align:center;">
+          <div class="spinner"></div>
+          <div style="color:var(--muted);font-size:var(--fs-sm);margin-top:8px;">Sedang memproses data XML...</div>
+        </div>
+        <div id="setup-msg" style="margin-top:12px;font-size:var(--fs-sm);font-weight:700;"></div>
+      </div>
+    </div>
+
+    <!-- Logo Sekolah -->
+    <div class="card admin-section">
+      <div class="card-head">
+        <div class="card-head-icon" style="background:linear-gradient(135deg,#0ea5e9,#0284c7);"><i class="fas fa-image"></i></div>
+        <div><div class="card-head-title">Logo Sekolah</div><div class="card-head-sub">Logo dipaparkan dalam output PDF</div></div>
+      </div>
+      <div class="card-body">
+        <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+          <div id="logo-preview-wrap" style="width:80px;height:80px;border-radius:12px;border:2px dashed #cbd5e1;display:flex;align-items:center;justify-content:center;background:#f8fafc;flex-shrink:0;overflow:hidden;">
+            <span id="logo-preview-empty" style="color:#94a3b8;font-size:.7rem;text-align:center;padding:6px;">Tiada logo</span>
+            <img id="logo-preview-img" style="display:none;width:100%;height:100%;object-fit:contain;">
+          </div>
+          <div style="flex:1;min-width:160px;">
+            <div style="font-size:.82rem;color:var(--navy);font-weight:700;margin-bottom:8px;">Upload logo baru:</div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <label class="btn btn-primary btn-sm" style="cursor:pointer;height:40px;">
+                <i class="fas fa-upload"></i> Pilih Gambar
+                <input type="file" id="logoFileInput" accept="image/*" style="display:none;" onchange="previewLogo(event)">
+              </label>
+              <button id="btn-save-logo" onclick="saveLogoAction()" class="btn btn-success btn-sm" style="display:none;height:40px;">
+                <i class="fas fa-save"></i> Simpan
+              </button>
+              <button onclick="removeLogoAction()" class="btn-ghost btn-sm" style="color:#e53e3e;border-color:#e53e3e;height:40px;" title="Padam logo">
+                <i class="fas fa-trash"></i>
+              </button>
+            </div>
+            <div style="color:var(--muted);font-size:.68rem;margin-top:6px;">PNG/JPG · Saiz disyorkan: 200×200px · PNG latar lutsinar lebih cantik</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Emel Pentadbir -->
+    <div class="card admin-section">
+      <div class="card-head">
+        <div class="card-head-icon" style="background:linear-gradient(135deg,#059669,#047857);"><i class="fas fa-envelope"></i></div>
+        <div><div class="card-head-title">Emel Pentadbir</div><div class="card-head-sub">Alamat emel penerima bila butang "Hantar Emel" digunakan</div></div>
+      </div>
+      <div class="card-body">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <input type="email" id="adminEmailInput" placeholder="pentadbir@sekolah.edu.my" class="input-field" style="flex:1;min-width:200px;">
+          <button id="btn-save-admin-email" onclick="saveAdminEmailAction()" class="btn btn-success btn-sm" style="height:40px;">
+            <i class="fas fa-save"></i> Simpan
+          </button>
+        </div>
+        <div style="color:var(--muted);font-size:.68rem;margin-top:6px;">PDF akan dihantar ke alamat ini sahaja bila anda klik butang "Hantar Emel" di Tapak Harian / Arkib. Kosongkan &amp; simpan untuk buang.</div>
+        <div id="admin-email-status" style="font-size:.72rem;font-weight:700;margin-top:6px;"></div>
+      </div>
+    </div>
+
+    <!-- Guru Tambahan -->
+    <div class="card admin-section">
+      <div class="card-head">
+        <div class="card-head-icon" style="background:linear-gradient(135deg,#7c3aed,#6d28d9);"><i class="fas fa-user-plus"></i></div>
+        <div><div class="card-head-title">Guru Tambahan</div><div class="card-head-sub">Guru yang tiada dalam jadual ASC</div></div>
+      </div>
+      <div class="card-body">
+        <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;">
+          <input type="text" id="extraTeacherName" placeholder="Nama penuh guru..." class="input-field" style="flex:2;min-width:140px;text-transform:uppercase;">
+          <input type="text" id="extraTeacherShort" placeholder="Singkatan" class="input-field" style="flex:1;min-width:80px;max-width:110px;text-transform:uppercase;">
+          <button onclick="addExtraTeacherAction(event)" class="btn btn-primary btn-sm btn-inline" style="height:var(--tap);">
+            <i class="fas fa-plus"></i> Tambah
+          </button>
+        </div>
+        <div id="extra-teacher-list">
+          <div style="padding:16px;text-align:center;color:var(--muted);font-size:.85rem;">Memuatkan...</div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /view-admin -->
+
+</div><!-- /main -->
+
+
+<!-- ═══════════════════════════════════════════════
+     MODAL: ASSIGN GURU GANTI
+     ═══════════════════════════════════════════════ -->
+<div id="assignModal" class="modal-overlay hidden">
+  <div class="modal-box">
+    <div class="modal-handle"></div>
+    <div class="modal-head">
+      <div class="modal-title"><i class="fas fa-user-check" style="color:var(--teal);"></i> Pilih Guru Ganti</div>
+      <button onclick="closeAssignModal()" class="modal-close"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="modal-body">
+      <!-- Info slot -->
+      <div class="assign-slot-info" id="assign-slot-info"></div>
+      <!-- Nota untuk guru ganti -->
+      <div class="note-section">
+        <div class="note-label"><i class="fas fa-sticky-note"></i> Catatan untuk Guru Ganti <span style="font-size:.6rem;font-weight:600;color:var(--muted);font-style:italic;text-transform:none;letter-spacing:0;">(akan terpapar dalam PDF)</span></div>
+        <textarea id="assign-note" class="note-textarea" placeholder="Cth: Bawa buku latihan, kelas ada ujian — pantau sahaja, ambil kertas soalan di bilik guru..."></textarea>
+      </div>
+      <!-- Sort bar -->
+      <div class="sort-bar">
+        <span class="sort-label"><i class="fas fa-sort-amount-down" style="margin-right:4px;"></i>Susun:</span>
+        <button class="sort-btn active" onclick="setSortAssign('free')" id="asort-free">Paling Bebas</button>
+        <button class="sort-btn" onclick="setSortAssign('busy')" id="asort-busy">Kurang Sibuk</button>
+        <button class="sort-btn" onclick="setSortAssign('name')" id="asort-name">Nama A–Z</button>
+      </div>
+      <!-- Guru available -->
+      <div class="assign-section-title"><i class="fas fa-circle" style="color:var(--success);font-size:.5rem;"></i> Guru Tersedia</div>
+      <div id="assign-available-list" class="assign-teacher-list"></div>
+      <!-- Guru busy (override) -->
+      <div class="divider"></div>
+      <div class="override-toggle" onclick="toggleOverride()" id="override-toggle-btn">
+        <div class="override-toggle-icon"><i class="fas fa-unlock-alt"></i></div>
+        <div class="override-toggle-text">
+          <div class="override-toggle-label">🔓 Override — Tunjuk Semua Guru</div>
+          <div class="override-toggle-sub">Termasuk guru yang sedang mengajar / tak hadir</div>
+        </div>
+        <i class="fas fa-chevron-down override-toggle-chevron" id="override-chevron"></i>
+      </div>
+      <div id="override-list-wrap" class="override-list hidden">
+        <div class="assign-section-title" style="margin-top:10px;">
+          <i class="fas fa-exclamation-triangle" style="color:var(--warn);font-size:.65rem;"></i>
+          Semua Guru (Pilihan Manual)
+        </div>
+        <div id="assign-override-list" class="assign-teacher-list"></div>
+      </div>
+    </div>
+    <div class="modal-foot" style="flex-wrap:wrap;gap:8px;">
+      <button onclick="saveNoteOnly()" class="btn btn-secondary btn-sm" style="flex:1;min-width:130px;">
+        <i class="fas fa-sticky-note"></i> Simpan Catatan
+      </button>
+      <button onclick="clearAssignment()" class="btn btn-danger btn-sm" style="flex:1;min-width:100px;">
+        <i class="fas fa-times"></i> Kosongkan
+      </button>
+      <button onclick="closeAssignModal()" class="btn btn-primary btn-sm" style="flex:1;min-width:80px;">
+        <i class="fas fa-check"></i> Selesai
+      </button>
+    </div>
+  </div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════
+     MODAL: PDF PREVIEW
+     ═══════════════════════════════════════════════ -->
+<div id="pdfModal" class="modal-overlay hidden">
+  <div class="modal-box" style="max-height:95vh;">
+    <div class="modal-handle"></div>
+    <div class="modal-head">
+      <div class="modal-title"><i class="fas fa-file-pdf" style="color:#dc2626;"></i> Pratonton PDF</div>
+      <button onclick="closePdfModal()" class="modal-close"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="modal-body" id="pdf-modal-body" style="padding:0;background:#e5e7eb;">
+      <div class="state-box" style="border-radius:0;border:none;background:#e5e7eb;">
+        <div class="spinner"></div>
+        <div class="state-title">Menjana PDF...</div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button onclick="closePdfModal()" class="btn btn-secondary btn-sm flex-1">
+        <i class="fas fa-times"></i> Tutup
+      </button>
+      <button onclick="downloadPDF()" id="btn-download-pdf" class="btn btn-success btn-sm flex-1" style="display:none;">
+        <i class="fas fa-download"></i> Muat Turun PDF
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Tukar Sebab Tidak Hadir -->
+<div id="reasonModal" class="modal-overlay hidden">
+  <div class="modal-box" style="max-height:60vh;">
+    <div class="modal-handle"></div>
+    <div class="modal-head">
+      <div class="modal-title"><i class="fas fa-comment-medical" style="color:var(--danger);"></i> Sebab Tidak Hadir</div>
+      <button onclick="closeReasonModal()" class="modal-close"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="modal-body" id="reason-modal-body" style="padding:16px;">
+    </div>
+  </div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════
+     HIDDEN PDF TEMPLATE (untuk print)
+     ═══════════════════════════════════════════════ -->
+<div id="pdf-template" style="display:none;">
+</div>
+
+
+<!-- ═══════════════════════════════════════════════
+     MODAL: CUSTOM CONFIRM
+     ═══════════════════════════════════════════════ -->
+<div id="confirmModal" class="confirm-overlay hidden">
+  <div class="confirm-box">
+    <div class="confirm-icon-wrap">
+      <div class="confirm-icon" id="confirm-icon"><i class="fas fa-question"></i></div>
+      <div class="confirm-title" id="confirm-title">Pengesahan</div>
+      <div class="confirm-msg" id="confirm-msg"></div>
+    </div>
+    <div class="confirm-foot">
+      <button class="confirm-btn confirm-btn-cancel" id="confirm-cancel-btn">Batal</button>
+      <button class="confirm-btn confirm-btn-ok" id="confirm-ok-btn">OK</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   CUSTOM CONFIRM — ganti browser confirm()
+   ═══════════════════════════════════════════════════════════ */
+function showConfirm({ title, msg, okLabel = 'Padam', okType = 'danger', icon = 'trash', onOk }) {
+  const modal      = document.getElementById('confirmModal');
+  const iconEl     = document.getElementById('confirm-icon');
+  const titleEl    = document.getElementById('confirm-title');
+  const msgEl      = document.getElementById('confirm-msg');
+  const okBtn      = document.getElementById('confirm-ok-btn');
+  const cancelBtn  = document.getElementById('confirm-cancel-btn');
+
+  const iconClass = { danger:'confirm-icon-danger', warn:'confirm-icon-warn', info:'confirm-icon-info' };
+  iconEl.className  = 'confirm-icon ' + (iconClass[okType] || 'confirm-icon-danger');
+  iconEl.innerHTML  = `<i class="fas fa-${icon}"></i>`;
+  titleEl.textContent = title;
+  msgEl.innerHTML     = msg;
+  okBtn.textContent   = okLabel;
+  okBtn.className     = 'confirm-btn confirm-btn-ok ' + (okType === 'warn' ? 'warn' : okType === 'primary' ? 'primary' : '');
+
+  modal.classList.remove('hidden');
+
+  // Clone butang untuk remove listener lama
+  const newOk     = okBtn.cloneNode(true);
+  const newCancel = cancelBtn.cloneNode(true);
+  okBtn.parentNode.replaceChild(newOk, okBtn);
+  cancelBtn.parentNode.replaceChild(newCancel, cancelBtn);
+
+  newOk.textContent   = okLabel;
+  newOk.className     = 'confirm-btn confirm-btn-ok ' + (okType === 'warn' ? 'warn' : okType === 'primary' ? 'primary' : '');
+
+  function close() { modal.classList.add('hidden'); }
+  newCancel.addEventListener('click', close);
+  newOk.addEventListener('click', () => { close(); onOk(); });
+  modal.addEventListener('click', e => { if (e.target === modal) close(); }, { once: true });
+}
+/* ═══════════════════════════════════════════════════════════
+   API — sambungan ke backend Google Apps Script (Web App)
+   ═══════════════════════════════════════════════════════════
+   Selepas deploy Apps Script sebagai Web App (Deploy → New deployment
+   → Web app → Execute as: Me → Access: Anyone), salin URL /exec dan
+   letak di bawah. */
+const API_URL = 'https://script.google.com/macros/s/AKfycbzJdUICFNhUcMpZbCe009iOwnUovJ8hbmvi40PH0lpfV1LD8ge7lMGgcdDfFP-B-P8u/exec';
+
+/* Tambah ?mock=1 pada URL (contoh: index.html?mock=1) untuk uji UI
+   tanpa sambungan backend sebenar (guna data contoh sahaja). */
+const isLocal = new URLSearchParams(location.search).has('mock');
+
+function callAPI(action, payload) {
+  return fetch(API_URL, {
+    method: 'POST',
+    // Content-Type text/plain sengaja digunakan supaya browser TIDAK
+    // menghantar preflight OPTIONS (Apps Script tidak sokong CORS preflight).
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ action, payload: payload === undefined ? null : payload })
+  })
+    .then(res => {
+      if (!res.ok) throw new Error('Ralat rangkaian (HTTP ' + res.status + ')');
+      return res.json();
+    })
+    .then(data => {
+      if (data && data.__error) throw new Error(data.__error);
+      return data;
+    });
+}
+
+let SCHOOL_LOGO_URL = null;
+let allTeachers = [];
+let currentBoard = null;        // state tapak harian semasa
+
+const ABSENT_REASONS = ['Urusan Rasmi', 'Cuti', 'Keluar Waktu Bekerja'];
+const REASON_STYLE = {
+  'Urusan Rasmi':          { bg: '#dbeafe', border: '#93c5fd', color: '#1e40af' },
+  'Cuti':                  { bg: '#ffedd5', border: '#fdba74', color: '#c2410c' },
+  'Keluar Waktu Bekerja':  { bg: '#ede9fe', border: '#c4b5fd', color: '#6d28d9' }
+};
+let currentAssignSlot = null;   // slot yang sedang dibuka untuk assign
+let assignSortKey = 'free';
+let busySectionOpen = false;
+
+// For PDF
+let pdfDoc = null;
+
+/* ── Helper: baca nama relief & note dari assignment value ──
+   Sokong format lama (string) dan baru (object { relief, note }) */
+function getReliefName(val) {
+  if (!val) return '';
+  if (typeof val === 'string') return val;
+  return val.relief || '';
+}
+function getReliefNote(val) {
+  if (!val || typeof val === 'string') return '';
+  return val.note || '';
+}
+
+/* ── Helper: format tarikh "YYYY-MM-DD" → "20 Julai 2026" (BM) ──
+   Dikongsi oleh semua fungsi print (nama tab/fail "Save as PDF") dan
+   emel (subjek emel) supaya konsisten format "Nama Dokumen - Tarikh". */
+const BM_MONTHS = ['Januari','Februari','Mac','April','Mei','Jun','Julai','Ogos','September','Oktober','November','Disember'];
+function formatTarikhBM(dateStr) {
+  if (!dateStr) return '';
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d.getTime())) return dateStr;
+  return `${d.getDate()} ${BM_MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   JANA PDF — CLIENT-SIDE (html2pdf.js), TIDAK PERLUKAN GOOGLE
+   DRIVE API. Sebelum ini sistem upload HTML→Drive→Google Doc→
+   export PDF, yang disekat oleh dasar domain Google Workspace
+   sekolah (403 insufficientPermissions walaupun scope betul).
+   Kaedah ni jana PDF terus dalam browser pengguna.
+   ═══════════════════════════════════════════════════════════ */
+function _generatePdfBlob(htmlContent, title, orientation) {
+  return new Promise((resolve, reject) => {
+    if (typeof html2pdf === 'undefined') {
+      reject(new Error('Library html2pdf gagal dimuatkan (semak sambungan internet).'));
+      return;
+    }
+    const container = document.createElement('div');
+    container.style.cssText = 'position:fixed;left:-9999px;top:0;width:794px;background:#fff;';
+    container.innerHTML = `<div style="font-family:'Plus Jakarta Sans',Arial,sans-serif;">${htmlContent}</div>`;
+    document.body.appendChild(container);
+
+    html2pdf().set({
+      margin: 8,
+      filename: title + '.pdf',
+      image: { type: 'jpeg', quality: 0.95 },
+      html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff' },
+      jsPDF: { unit: 'mm', format: 'a4', orientation: orientation || 'portrait' },
+      pagebreak: { mode: ['css', 'legacy'] }
+    }).from(container).outputPdf('blob')
+      .then(blob => { document.body.removeChild(container); resolve(blob); })
+      .catch(err => { document.body.removeChild(container); reject(err); });
+  });
+}
+
+function _generatePdfBase64(htmlContent, title, orientation) {
+  return _generatePdfBlob(htmlContent, title, orientation).then(blob => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result.split(',')[1]);
+    reader.onerror   = reject;
+    reader.readAsDataURL(blob);
+  }));
+}
+
+function _downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+window.onload = function() {
+  const today = new Date().toISOString().split('T')[0];
+  document.getElementById('boardDate').value = today;
+  document.getElementById('historyDate').value = today;
+  updateDateDisplay();
+  loadTeachersGlobal();
+  initLogo();
+  loadAdminEmailSetting();
+  registerServiceWorker();
+};
+
+/* ── PWA: daftar service worker (untuk offline shell + "Tambah ke Skrin Utama") ── */
+function registerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.register('/sw.js')
+    .catch(err => console.warn('Pendaftaran Service Worker gagal:', err));
+}
+
+function updateDateDisplay() {
+  const opt = {weekday:'short',year:'numeric',month:'short',day:'numeric'};
+  document.getElementById('current-date-display').textContent = new Date().toLocaleDateString('ms-MY', opt);
+}
+
+function initLogo() {
+  if (isLocal) return;
+  callAPI('getLogo').then(b64 => {
+    if (b64) {
+      SCHOOL_LOGO_URL = b64;
+      document.querySelectorAll('.school-logo-img').forEach(img => {
+        img.src = b64; img.style.display = '';
+      });
+      document.getElementById('navbar-icon-fallback').style.display = 'none';
+    } else {
+      document.getElementById('navbar-icon-fallback').style.display = 'flex';
+    }
+  }).catch(e => { document.getElementById('navbar-icon-fallback').style.display = 'flex'; });
+}
+
+/* ── Tetapan Emel Pentadbir ── */
+function loadAdminEmailSetting() {
+  if (isLocal) return;
+  callAPI('getAdminEmail').then(email => {
+    const input = document.getElementById('adminEmailInput');
+    if (input) input.value = email || '';
+  }).catch(() => {});
+}
+
+function saveAdminEmailAction() {
+  const input  = document.getElementById('adminEmailInput');
+  const status = document.getElementById('admin-email-status');
+  const btn    = document.getElementById('btn-save-admin-email');
+  const email  = (input?.value || '').trim();
+
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+
+  callAPI('saveAdminEmail', email)
+    .then(res => {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-save"></i> Simpan';
+      if (res.success) {
+        if (status) { status.style.color = '#059669'; status.textContent = email ? '✅ Emel pentadbir disimpan.' : 'Emel pentadbir dibuang.'; }
+        showAlert(email ? '✅ Emel pentadbir disimpan!' : 'Emel pentadbir dibuang.', 'success');
+      } else {
+        if (status) { status.style.color = '#dc2626'; status.textContent = '❌ ' + (res.message || 'Gagal simpan.'); }
+        showAlert('Gagal simpan: ' + (res.message || ''), 'error');
+      }
+    })
+    .catch(err => {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-save"></i> Simpan';
+      showAlert('Ralat: ' + err.message, 'error');
+    });
+}
+
+/* ── Hantar PDF ke Emel Pentadbir (on-demand) ──
+   Fungsi teras dikongsi oleh Tapak Harian & Arkib. Penerima ditentukan
+   di SERVER (ADMIN_EMAIL dalam Tetapan) — klien tidak hantar alamat
+   emel, jadi butang ini hanya boleh hantar ke alamat yang admin sendiri
+   dah tetapkan. */
+function sendPDFToAdminEmail(htmlContent, filenameBase, dateStr, btn) {
+  if (!btn) return;
+  const tarikhLabel = formatTarikhBM(dateStr);
+  const docTitle = `${filenameBase} - ${tarikhLabel}`;
+  const origHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menjana PDF...';
+
+  _generatePdfBase64(htmlContent, docTitle)
+    .then(base64Pdf => {
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menghantar...';
+      return callAPI('sendPDFEmail', { base64Pdf, filename: docTitle, dateLabel: tarikhLabel });
+    })
+    .then(res => {
+      btn.disabled = false; btn.innerHTML = origHTML;
+      if (res.success) {
+        showAlert(`✅ PDF berjaya dihantar ke ${res.sentTo}`, 'success');
+      } else {
+        showAlert('Gagal hantar emel: ' + (res.message || ''), 'error');
+      }
+    })
+    .catch(err => {
+      btn.disabled = false; btn.innerHTML = origHTML;
+      showAlert('Ralat jana/hantar PDF: ' + err.message, 'error');
+      console.error(err);
+    });
+}
+
+function loadTeachersGlobal() {
+  if (isLocal) {
+    allTeachers = [
+      {id:'T1',name:'CIKGU ALI BIN ABU',short:'ALI'},
+      {id:'T2',name:'CIKGU SITI BINTI SAMAD',short:'SITI'},
+      {id:'T3',name:'CIKGU WONG WEI LIANG',short:'WONG'},
+      {id:'T4',name:'CIKGU MUTHU A/L SAMI',short:'MUTHU'},
+      {id:'T5',name:'CIKGU JESSICA TAN',short:'JES'},
+      {id:'T6',name:'USTAZ ADAM BIN KARIM',short:'ADAM'},
+    ];
+    populateAbsentSelect();
+  } else {
+    callAPI('getTeacherList')
+      .then(d => { allTeachers = d; populateAbsentSelect(); })
+      .catch(e => showAlert('Gagal muatkan senarai guru: ' + e.message, 'error'));
+  }
+}
+
+function populateAbsentSelect() {
+  const sel = document.getElementById('absent-select');
+  sel.innerHTML = '<option value="">— Pilih guru untuk tambah —</option>';
+  allTeachers.forEach(t => {
+    const o = document.createElement('option');
+    o.value = t.id; o.text = t.name;
+    sel.appendChild(o);
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   TAB SWITCHING
+   ═══════════════════════════════════════════════════════════ */
+window.switchTab = function(tabName) {
+  ['daily','history','admin'].forEach(t => {
+    document.getElementById(`view-${t}`).classList.add('hidden');
+    document.getElementById(`tab-${t}`).classList.remove('active');
+  });
+  document.getElementById(`view-${tabName}`).classList.remove('hidden');
+  document.getElementById(`tab-${tabName}`).classList.add('active');
+  window.scrollTo({top:0,behavior:'smooth'});
+  if (tabName === 'admin') {
+    setTimeout(loadExtraTeachersAdmin, 100);
+    setTimeout(loadAdminLogoPreview, 150);
+  }
+};
+
+/* ═══════════════════════════════════════════════════════════
+   TAPAK HARIAN — LOAD
+   ═══════════════════════════════════════════════════════════ */
+function loadBoard() {
+  const date = document.getElementById('boardDate').value;
+  if (!date) { showAlert('Sila pilih tarikh.', 'warn'); return; }
+
+  const btn = document.querySelector('button[onclick="loadBoard()"]');
+  const origHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Memuatkan...';
+
+  document.getElementById('board-empty').classList.add('hidden');
+  document.getElementById('board-content').classList.add('hidden');
+  document.getElementById('board-loading').classList.remove('hidden');
+
+  function restoreBtn() {
+    btn.disabled = false;
+    btn.innerHTML = origHTML;
+  }
+
+  if (isLocal) {
+    setTimeout(() => {
+      restoreBtn();
+      const mockBoard = {
+        success: true, exists: false,
+        date, dayName: 'Isnin',
+        absentIds: [],
+        assignments: {},
+        status: 'draft',
+        periods: [
+          {id:'1',start:'7.40am',end:'8.10am'},
+          {id:'2',start:'8.10am',end:'8.40am'},
+          {id:'3',start:'8.40am',end:'9.10am'},
+          {id:'REHAT',start:'9.10am',end:'9.40am'},
+          {id:'4',start:'9.40am',end:'10.10am'},
+          {id:'5',start:'10.10am',end:'10.40am'},
+        ],
+        classes: ['1 BESTARI','1 CERDAS','2 BESTARI','2 CERDAS'],
+        grid: {
+          '1 BESTARI': {
+            '1':{subject:'BM',teacherId:'T1',teacherName:'CIKGU ALI BIN ABU',isAbsent:false,reliefTeacher:'',assignKey:'T1|1|1 BESTARI'},
+            '2':{subject:'MT',teacherId:'T2',teacherName:'CIKGU SITI BINTI SAMAD',isAbsent:false,reliefTeacher:'',assignKey:'T2|2|1 BESTARI'},
+            '3':{subject:'PI',teacherId:'T3',teacherName:'CIKGU WONG WEI LIANG',isAbsent:false,reliefTeacher:'',assignKey:'T3|3|1 BESTARI'},
+            '4':{subject:'SN',teacherId:'T4',teacherName:'CIKGU MUTHU A/L SAMI',isAbsent:false,reliefTeacher:'',assignKey:'T4|4|1 BESTARI'},
+            '5':{subject:'BM',teacherId:'T1',teacherName:'CIKGU ALI BIN ABU',isAbsent:false,reliefTeacher:'',assignKey:'T1|5|1 BESTARI'},
+          },
+          '1 CERDAS': {
+            '1':{subject:'MT',teacherId:'T3',teacherName:'CIKGU WONG WEI LIANG',isAbsent:false,reliefTeacher:'',assignKey:'T3|1|1 CERDAS'},
+            '2':{subject:'BM',teacherId:'T4',teacherName:'CIKGU MUTHU A/L SAMI',isAbsent:false,reliefTeacher:'',assignKey:'T4|2|1 CERDAS'},
+            '3':{subject:'SN',teacherId:'T1',teacherName:'CIKGU ALI BIN ABU',isAbsent:false,reliefTeacher:'',assignKey:'T1|3|1 CERDAS'},
+            '4':{subject:'PI',teacherId:'T5',teacherName:'CIKGU JESSICA TAN',isAbsent:false,reliefTeacher:'',assignKey:'T5|4|1 CERDAS'},
+            '5':{subject:'MT',teacherId:'T2',teacherName:'CIKGU SITI BINTI SAMAD',isAbsent:false,reliefTeacher:'',assignKey:'T2|5|1 CERDAS'},
+          },
+          '2 BESTARI': {
+            '1':{subject:'SN',teacherId:'T5',teacherName:'CIKGU JESSICA TAN',isAbsent:false,reliefTeacher:'',assignKey:'T5|1|2 BESTARI'},
+            '2':{subject:'PI',teacherId:'T6',teacherName:'USTAZ ADAM BIN KARIM',isAbsent:false,reliefTeacher:'',assignKey:'T6|2|2 BESTARI'},
+            '3':{subject:'MT',teacherId:'T2',teacherName:'CIKGU SITI BINTI SAMAD',isAbsent:false,reliefTeacher:'',assignKey:'T2|3|2 BESTARI'},
+            '4':{subject:'BM',teacherId:'T3',teacherName:'CIKGU WONG WEI LIANG',isAbsent:false,reliefTeacher:'',assignKey:'T3|4|2 BESTARI'},
+            '5':{subject:'SN',teacherId:'T6',teacherName:'USTAZ ADAM BIN KARIM',isAbsent:false,reliefTeacher:'',assignKey:'T6|5|2 BESTARI'},
+          },
+          '2 CERDAS': {
+            '1':{subject:'PI',teacherId:'T2',teacherName:'CIKGU SITI BINTI SAMAD',isAbsent:false,reliefTeacher:'',assignKey:'T2|1|2 CERDAS'},
+            '2':{subject:'SN',teacherId:'T1',teacherName:'CIKGU ALI BIN ABU',isAbsent:false,reliefTeacher:'',assignKey:'T1|2|2 CERDAS'},
+            '3':{subject:'BM',teacherId:'T4',teacherName:'CIKGU MUTHU A/L SAMI',isAbsent:false,reliefTeacher:'',assignKey:'T4|3|2 CERDAS'},
+            '4':{subject:'MT',teacherId:'T6',teacherName:'USTAZ ADAM BIN KARIM',isAbsent:false,reliefTeacher:'',assignKey:'T6|4|2 CERDAS'},
+            '5':{subject:'PI',teacherId:'T3',teacherName:'CIKGU WONG WEI LIANG',isAbsent:false,reliefTeacher:'',assignKey:'T3|5|2 CERDAS'},
+          }
+        },
+        periodAvailMap: {}
+      };
+      applyBoard(mockBoard);
+    }, 800);
+  } else {
+    callAPI('getDailyBoard', date)
+      .then(board => { restoreBtn(); applyBoard(board); })
+      .catch(e => {
+        restoreBtn();
+        document.getElementById('board-loading').classList.add('hidden');
+        document.getElementById('board-empty').classList.remove('hidden');
+        showAlert('Gagal muatkan tapak: ' + e.message, 'error');
+      });
+  }
+}
+
+function applyBoard(board) {
+  document.getElementById('board-loading').classList.add('hidden');
+  if (!board || !board.success) {
+    showAlert(board?.message || 'Ralat memuatkan tapak.', 'error');
+    document.getElementById('board-empty').classList.remove('hidden');
+    return;
+  }
+
+  currentBoard = board;
+
+  // Update board header
+  updateBoardHeader(board);
+
+  // Update absent panel
+  renderAbsentPanel(board.absentIds || [], board.absentReasons || {});
+
+  // Render timetable grid
+  renderTimetable(board);
+
+  document.getElementById('board-content').classList.remove('hidden');
+  document.getElementById('board-empty').classList.add('hidden');
+}
+
+function updateBoardHeader(board) {
+  const d = new Date(board.date + 'T00:00:00');
+  const days = ['Ahad','Isnin','Selasa','Rabu','Khamis','Jumaat','Sabtu'];
+  const months = ['Jan','Feb','Mac','Apr','Mei','Jun','Jul','Ogos','Sep','Okt','Nov','Dis'];
+
+  document.getElementById('bh-dayname').textContent = board.dayName || days[d.getDay()];
+  document.getElementById('bh-datenum').textContent = d.getDate();
+  document.getElementById('bh-month').textContent = months[d.getMonth()] + ' ' + d.getFullYear();
+
+  const absentCount = (board.absentIds || []).length;
+  document.getElementById('bh-title').textContent =
+    absentCount > 0 ? `${absentCount} guru tidak hadir` : 'Tiada guru tidak hadir';
+
+  const chip = document.getElementById('bh-status-chip');
+  if (board.status === 'confirmed') {
+    chip.className = 'chip chip-confirmed';
+    chip.innerHTML = '<i class="fas fa-check"></i> Disahkan';
+  } else {
+    chip.className = 'chip chip-draft';
+    chip.innerHTML = '<i class="fas fa-pencil-alt"></i> Draft';
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ABSENT PANEL
+   ═══════════════════════════════════════════════════════════ */
+function renderAbsentPanel(absentIds, absentReasons) {
+  absentReasons = absentReasons || {};
+  const container = document.getElementById('absent-tags-container');
+  const countChip = document.getElementById('absent-count-chip');
+
+  // Update select — buang yang dah dalam senarai
+  const sel = document.getElementById('absent-select');
+  sel.innerHTML = '<option value="">— Pilih guru untuk tambah —</option>';
+  allTeachers.forEach(t => {
+    if (absentIds.includes(t.id)) return;
+    const o = document.createElement('option');
+    o.value = t.id; o.text = t.name;
+    sel.appendChild(o);
+  });
+
+  if (!absentIds.length) {
+    container.innerHTML = '<span class="absent-empty">Tiada guru ditanda tidak hadir.</span>';
+    countChip.className = 'chip chip-empty';
+    countChip.textContent = '0 orang';
+    return;
+  }
+
+  countChip.className = 'chip chip-draft';
+  countChip.textContent = absentIds.length + ' orang';
+
+  container.innerHTML = '';
+  absentIds.forEach(id => {
+    const t = allTeachers.find(x => x.id === id);
+    if (!t) return;
+    const reason = absentReasons[id] || '';
+    const s = REASON_STYLE[reason] || { bg: '#f1f5f9', border: '#cbd5e1', color: '#64748b' };
+    const reasonLabel = reason || 'Sebab?';
+    const tag = document.createElement('span');
+    tag.className = 'absent-tag';
+    tag.innerHTML = `<i class="fas fa-user-times" style="font-size:.6rem;flex-shrink:0;"></i><span class="absent-tag-name">${t.name}</span><span class="absent-reason-badge" style="background:${s.bg};border-color:${s.border};color:${s.color};" onclick="openReasonModal('${id}')" title="Tukar sebab">${reasonLabel}</span><button class="absent-tag-remove" onclick="removeAbsent('${id}')" title="Buang"><i class="fas fa-times"></i></button>`;
+    container.appendChild(tag);
+  });
+}
+
+/* ── Modal: pilih/tukar sebab tidak hadir ── */
+let _reasonModalTeacherId = null;
+
+function openReasonModal(teacherId) {
+  _reasonModalTeacherId = teacherId;
+  const t = allTeachers.find(x => x.id === teacherId);
+  const currentReason = (currentBoard.absentReasons || {})[teacherId] || '';
+  const body = document.getElementById('reason-modal-body');
+  body.innerHTML =
+    `<div style="font-weight:800;margin-bottom:12px;color:var(--text);">${t ? t.name : ''}</div>` +
+    ABSENT_REASONS.map(r => {
+      const active = r === currentReason;
+      const s = REASON_STYLE[r];
+      const style = active
+        ? `border-color:${s.border};background:${s.bg};color:${s.color};`
+        : '';
+      return `<button class="reason-pick-btn" style="${style}" onclick="pickReason('${r.replace(/'/g, "\\'")}')">${active ? '✓ ' : ''}${r}</button>`;
+    }).join('');
+  document.getElementById('reasonModal').classList.remove('hidden');
+}
+
+function closeReasonModal() {
+  document.getElementById('reasonModal').classList.add('hidden');
+  _reasonModalTeacherId = null;
+}
+
+function pickReason(reason) {
+  const teacherId = _reasonModalTeacherId;
+  const date = document.getElementById('boardDate').value;
+  closeReasonModal();
+  if (!teacherId) return;
+
+  if (isLocal) {
+    if (!currentBoard.absentReasons) currentBoard.absentReasons = {};
+    currentBoard.absentReasons[teacherId] = reason;
+    renderAbsentPanel(currentBoard.absentIds, currentBoard.absentReasons);
+    return;
+  }
+  callAPI('updateAbsentReason', { date, teacherId, reason })
+    .then(board => {
+      if (!board.success) { showAlert(board.message, 'error'); return; }
+      applyBoard(board);
+    })
+    .catch(e => showAlert('Ralat: ' + e.message, 'error'));
+}
+
+function addAbsent() {
+  const sel = document.getElementById('absent-select');
+  const id  = sel.value;
+  if (!id) { showAlert('Sila pilih nama guru.', 'warn'); return; }
+
+  const reasonSel = document.getElementById('absent-reason-select');
+  const reason = reasonSel.value;
+  if (!reason) { showAlert('Sila pilih sebab ketidakhadiran.', 'warn'); return; }
+
+  const date = document.getElementById('boardDate').value;
+  const btn  = document.querySelector('.btn-tambah');
+  const origHTML = btn.innerHTML;
+
+  sel.disabled = true;
+  reasonSel.disabled = true;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+
+  function restoreBtn() { sel.disabled = false; reasonSel.disabled = false; btn.disabled = false; btn.innerHTML = origHTML; }
+  function resetReasonSelect() { reasonSel.value = ''; }
+
+  if (isLocal) {
+    if (!currentBoard.absentIds) currentBoard.absentIds = [];
+    currentBoard.absentIds.push(id);
+    if (!currentBoard.absentReasons) currentBoard.absentReasons = {};
+    currentBoard.absentReasons[id] = reason;
+    Object.values(currentBoard.grid || {}).forEach(row => {
+      Object.values(row).forEach(cell => {
+        if (cell.teacherId === id) { cell.isAbsent = true; cell.absentReason = reason; }
+      });
+    });
+    restoreBtn();
+    resetReasonSelect();
+    renderAbsentPanel(currentBoard.absentIds, currentBoard.absentReasons);
+    renderTimetable(currentBoard);
+    updateBoardHeader(currentBoard);
+  } else {
+    callAPI('addAbsentTeacher', { date, teacherId: id, reason })
+      .then(board => {
+        restoreBtn();
+        resetReasonSelect();
+        if (!board.success) { showAlert(board.message, 'error'); return; }
+        applyBoard(board);
+      })
+      .catch(e => { restoreBtn(); showAlert('Ralat: ' + e.message, 'error'); });
+  }
+}
+
+function removeAbsent(teacherId) {
+  const t = allTeachers.find(x => x.id === teacherId);
+  showConfirm({
+    title: 'Buang Guru Tidak Hadir',
+    msg: `Buang <strong>${t ? t.name : 'guru ini'}</strong> dari senarai?<br><br>Semua assignment guru ganti untuk guru ini akan dipadam.`,
+    okLabel: 'Ya, Buang',
+    okType: 'danger',
+    icon: 'user-times',
+    onOk: () => {
+      const date = document.getElementById('boardDate').value;
+      document.querySelectorAll('.absent-tag-remove').forEach(b => b.disabled = true);
+      const tag = document.querySelector(`.absent-tag-remove[onclick="removeAbsent('${teacherId}')"]`);
+      if (tag) tag.innerHTML = '<i class="fas fa-spinner fa-spin" style="font-size:.6rem;"></i>';
+      function restoreIfFail() { document.querySelectorAll('.absent-tag-remove').forEach(b => b.disabled = false); }
+      if (isLocal) {
+        currentBoard.absentIds = (currentBoard.absentIds || []).filter(id => id !== teacherId);
+        if (currentBoard.absentReasons) delete currentBoard.absentReasons[teacherId];
+        Object.values(currentBoard.grid || {}).forEach(row => {
+          Object.values(row).forEach(cell => {
+            if (cell.teacherId === teacherId) { cell.isAbsent = false; cell.reliefTeacher = ''; cell.absentReason = ''; }
+          });
+        });
+        Object.keys(currentBoard.assignments || {}).forEach(key => {
+          if (key.startsWith(teacherId + '|')) delete currentBoard.assignments[key];
+        });
+        renderAbsentPanel(currentBoard.absentIds, currentBoard.absentReasons);
+        renderTimetable(currentBoard);
+        updateBoardHeader(currentBoard);
+      } else {
+        callAPI('removeAbsentTeacher', { date, teacherId })
+          .then(board => {
+            if (!board.success) { restoreIfFail(); showAlert(board.message, 'error'); return; }
+            applyBoard(board);
+          })
+          .catch(e => { restoreIfFail(); showAlert('Ralat: ' + e.message, 'error'); });
+      }
+    }
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   TIMETABLE GRID RENDERER
+   ═══════════════════════════════════════════════════════════ */
+function renderTimetable(board) {
+  const container = document.getElementById('timetable-container');
+  const statBar   = document.getElementById('slot-stat-bar');
+
+  const periods = board.periods || [];
+  const classes = board.classes || [];
+  const grid    = board.grid    || {};
+
+  if (!periods.length || !classes.length) {
+    container.innerHTML = `<div class="state-box" style="border-radius:0;border:none;">
+      <div class="state-icon"><i class="fas fa-table"></i></div>
+      <div class="state-title">Jadual Tiada Data</div>
+      <div class="state-sub">Tiada data jadual untuk hari ini. Sila muat naik jadual XML dahulu.</div>
+    </div>`;
+    statBar.style.display = 'none';
+    return;
+  }
+
+  // ── Kumpul semua guru dari teacherMap (FIX: sokong multi-guru satu slot) ──
+  // teacherMap dari server menyimpan SEMUA guru tanpa kehilangan data
+  // (berbeza grid yang overwrite apabila dua guru kongsi kelas+waktu sama)
+  const guruMap = {};
+  if (board.teacherMap) {
+    Object.entries(board.teacherMap).forEach(([tid, data]) => {
+      const slots = {};
+      periods.forEach(p => {
+        if (p.id === 'REHAT') return;
+        const slotArr = data[p.id];
+        if (slotArr && slotArr.length) slots[p.id] = slotArr;
+      });
+      if (Object.keys(slots).length > 0) {
+        guruMap[tid] = { name: data.name, id: tid, slots };
+      }
+    });
+  } else {
+    // Fallback lama — guna grid (mungkin ada slot hilang jika team-teaching)
+    classes.forEach(cls => {
+      periods.forEach(p => {
+        if (p.id === 'REHAT') return;
+        const cell = grid[cls]?.[p.id];
+        if (!cell) return;
+        const tid = cell.teacherId;
+        if (!guruMap[tid]) guruMap[tid] = { name: cell.teacherName, id: tid, slots: {} };
+        if (!guruMap[tid].slots[p.id]) guruMap[tid].slots[p.id] = [];
+        guruMap[tid].slots[p.id].push({ ...cell, className: cls });
+      });
+    });
+  }
+
+  // Sort: guru tak hadir dulu, kemudian ikut nama
+  const absentSet = new Set(board.absentIds || []);
+  const guruList  = Object.values(guruMap).sort((a, b) => {
+    const aA = absentSet.has(a.id), bA = absentSet.has(b.id);
+    if (aA && !bA) return -1;
+    if (!aA && bA) return 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  // Kira stats — slots kini array
+  let statPending = 0, statDone = 0, statNormal = 0;
+  guruList.forEach(g => {
+    periods.forEach(p => {
+      if (p.id === 'REHAT') return;
+      const slotArr = g.slots[p.id] || [];
+      slotArr.forEach(cell => {
+        if (!absentSet.has(g.id)) { statNormal++; return; }
+        if (!cell.reliefTeacher) statPending++;
+        else statDone++;
+      });
+    });
+  });
+
+  document.getElementById('stat-pending').textContent = statPending + ' slot belum isi';
+  document.getElementById('stat-done').textContent    = statDone + ' slot dah isi';
+  document.getElementById('stat-normal').textContent  = statNormal + ' slot biasa';
+  statBar.style.display = 'flex';
+
+  // Bina peta: siapa jadi relief pada period mana
+  // { teacherName: Set<periodId> }
+  const reliefDutyMap = {};
+  Object.entries(board.assignments || {}).forEach(([key, val]) => {
+    const reliefName = getReliefName(val);
+    if (!reliefName) return;
+    const periodId = key.split('|')[1];
+    if (!reliefDutyMap[reliefName]) reliefDutyMap[reliefName] = new Set();
+    reliefDutyMap[reliefName].add(periodId);
+  });
+
+  // ── Build HTML ──
+  let html = '<table class="tt-table"><thead><tr class="tt-head-row">';
+  html += `<th class="tt-sticky tt-head-guru">GURU</th>`;
+  periods.forEach(p => {
+    if (p.id === 'REHAT') {
+      html += `<th class="tt-head-rehat">☕<div style="font-size:.5rem;margin-top:2px;">Rehat</div></th>`;
+    } else {
+      html += `<th class="tt-head-period">
+        <div class="tt-head-period-num">Wkt ${p.id}</div>
+        <div class="tt-head-period-time">${p.start}</div>
+        <div class="tt-head-period-time">${p.end}</div>
+      </th>`;
+    }
+  });
+  html += '</tr></thead><tbody>';
+
+  guruList.forEach(g => {
+    const isAbsent = absentSet.has(g.id);
+    const reason = (board.absentReasons || {})[g.id] || '';
+    // Nama guru — potong kalau panjang
+    const nameParts = g.name.split(' ');
+    const shortName = nameParts.length > 3
+      ? nameParts.slice(0, 3).join(' ') + '…'
+      : g.name;
+
+    html += `<tr>`;
+    html += `<td class="tt-sticky tt-guru-cell ${isAbsent ? 'tt-guru-absent' : ''}">
+      <span class="tt-guru-name">${escHtml(shortName)}</span>
+      ${isAbsent ? `<span class="tt-guru-tag" title="${escHtml(reason)}">✗ ${reason || 'Tak Hadir'}</span>` : ''}
+    </td>`;
+
+    periods.forEach(p => {
+      if (p.id === 'REHAT') {
+        html += `<td class="tt-slot s-rehat"><div class="tt-slot-inner"><div class="tt-rehat-inner"><div class="tt-rehat-text">Rehat</div></div></div></td>`;
+        return;
+      }
+
+      const cells = g.slots[p.id] || [];
+
+      // Semak sama ada guru ini sedang jadi relief pada waktu ini
+      const isOnReliefDuty = reliefDutyMap[g.name]?.has(String(p.id));
+
+      if (!cells.length) {
+        // Slot kosong — tapi mungkin guru ni sedang jadi relief
+        if (isOnReliefDuty) {
+          // Cari nama kelas yang dia relief — guna getReliefName() untuk sokong format baru
+          const dutyClass = Object.entries(board.assignments || {}).find(([k, v]) =>
+            getReliefName(v) === g.name && k.split('|')[1] === String(p.id)
+          );
+          const dutyClassName = dutyClass ? dutyClass[0].split('|')[2] : '?';
+          html += `<td class="tt-slot s-relief-duty">
+            <div class="tt-slot-inner">
+              <div class="tt-slot-subj">📌 Relief</div>
+              <div class="tt-slot-duty-badge"><i class="fas fa-arrow-right" style="font-size:.4rem;"></i>${escHtml(dutyClassName)}</div>
+            </div>
+          </td>`;
+        } else {
+          html += `<td class="tt-slot s-empty"><div class="tt-slot-inner"></div></td>`;
+        }
+        return;
+      }
+
+      // Ambil cell pertama (biasanya 1 sahaja)
+      const cell = cells[0];
+
+      if (!isAbsent) {
+        // Semak sama ada guru ni jadi relief pada waktu ini (override situation)
+        const isOverride = reliefDutyMap[g.name]?.has(String(p.id));
+
+        if (isOverride) {
+          // Cari nama kelas yang dia relief — guna getReliefName() untuk sokong format baru
+          const dutyEntry = Object.entries(board.assignments || {}).find(([k,v]) =>
+            getReliefName(v) === g.name && k.split('|')[1] === String(p.id)
+          );
+          const dutyClass = dutyEntry ? dutyEntry[0].split('|')[2] : '?';
+          html += `<td class="tt-slot s-override">
+            <div class="tt-slot-inner">
+              <div class="tt-slot-subj">${escHtml(cell.subject)}</div>
+              <div class="tt-slot-class">${escHtml(cell.className)}</div>
+              <div class="tt-slot-override-badge">⚠️ +Relief ${escHtml(dutyClass)}</div>
+            </div>
+          </td>`;
+        } else {
+          html += `<td class="tt-slot s-normal">
+            <div class="tt-slot-inner">
+              <div class="tt-slot-subj">${escHtml(cell.subject)}</div>
+              <div class="tt-slot-class">${escHtml(cell.className)}</div>
+            </div>
+          </td>`;
+        }
+        return;
+      }
+
+      // Guru tak hadir
+      let slotClass = 's-absent';
+      if (cell.reliefTeacher) slotClass = 's-done';
+
+      const clickAttr = `onclick="openAssignModal('${escJs(cell.assignKey)}')"`;
+
+      let reliefHtml = '';
+      if (cell.reliefTeacher) {
+        // Singkatkan nama relief
+        const rParts = cell.reliefTeacher.split(' ');
+        const rShort = rParts.length > 2 ? rParts[0] + ' ' + rParts[1] : cell.reliefTeacher;
+        const noteIcon = cell.note ? `<span class="tt-slot-note-icon">📝</span>` : '';
+        reliefHtml = `<div class="tt-slot-relief"><i class="fas fa-check" style="font-size:.45rem;"></i>${escHtml(rShort)}${noteIcon}</div>`;
+      } else {
+        reliefHtml = `<div class="tt-slot-add"><i class="fas fa-plus" style="font-size:.45rem;"></i>Isi</div>`;
+      }
+
+      html += `<td class="tt-slot ${slotClass}" ${clickAttr}>
+        <div class="tt-slot-inner">
+          <div class="tt-slot-subj">${escHtml(cell.subject)}</div>
+          <div class="tt-slot-class">${escHtml(cell.className)}</div>
+          ${reliefHtml}
+        </div>
+      </td>`;
+    });
+
+    html += `</tr>`;
+  });
+
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   PRINT JADUAL INDUK — Admin tab, pilih hari, jadual asal tulen
+   Tiada kaitan dengan kehadiran / guru ganti
+   ═══════════════════════════════════════════════════════════ */
+function printJadualIndukByDay() {
+  const dayNum   = document.getElementById('print-day-select')?.value || '1';
+  const dayNames = { '1':'Isnin', '2':'Selasa', '3':'Rabu', '4':'Khamis', '5':'Jumaat' };
+  const dayName  = dayNames[dayNum] || 'Isnin';
+  if (isLocal) {
+    if (!currentBoard) { showAlert('Tiada data jadual. Sila muat naik XML terlebih dahulu.', 'error'); return; }
+    _doPrintJadualInduk(currentBoard, dayName, '');
+    return;
+  }
+  showAlert('Sedang memuatkan jadual ' + dayName + '...', 'info');
+  callAPI('getBoardDataForDay', Number(dayNum))
+    .then(res => {
+      if (!res || !res.success) { showAlert(res?.message || 'Gagal memuatkan data jadual.', 'error'); return; }
+      _doPrintJadualInduk(res, dayName, res.date || '');
+    })
+    .catch(err => { showAlert('Ralat: ' + (err.message || err), 'error'); });
+}
+
+function printJadualInduk() {
+  if (!currentBoard) { showAlert('Tiada data jadual untuk diprint.', 'error'); return; }
+  _doPrintJadualInduk(currentBoard, currentBoard.dayName || '', document.getElementById('boardDate')?.value || '');
+}
+
+function _doPrintJadualInduk(board, dayName, dateStr) {
+  const periods = board.periods || [];
+
+  // Bina guruMap dari teacherMap (atau grid sebagai fallback)
+  const guruMap = {};
+  if (board.teacherMap) {
+    Object.entries(board.teacherMap).forEach(([tid, data]) => {
+      const slots = {};
+      periods.forEach(p => {
+        if (p.id === 'REHAT') return;
+        const arr = data[p.id];
+        if (arr && arr.length) slots[p.id] = arr;
+      });
+      if (Object.keys(slots).length > 0)
+        guruMap[tid] = { name: data.name, slots };
+    });
+  } else {
+    (board.classes || []).forEach(cls => {
+      periods.forEach(p => {
+        if (p.id === 'REHAT') return;
+        const cell = (board.grid || {})[cls]?.[p.id];
+        if (!cell) return;
+        const tid = cell.teacherId;
+        if (!guruMap[tid]) guruMap[tid] = { name: cell.teacherName, slots: {} };
+        if (!guruMap[tid].slots[p.id]) guruMap[tid].slots[p.id] = [];
+        guruMap[tid].slots[p.id].push({ subject: cell.subject, className: cls });
+      });
+    });
+  }
+
+  // Sort ikut nama sahaja
+  const guruList = Object.values(guruMap).sort((a, b) => a.name.localeCompare(b.name));
+
+  // ── Header row ──
+  let thHtml = `<th class="col-guru">GURU</th>`;
+  periods.forEach(p => {
+    if (p.id === 'REHAT') {
+      thHtml += `<th class="col-rehat">REHAT<br><span class="time">${escHtml(p.start)}–${escHtml(p.end)}</span></th>`;
+    } else {
+      thHtml += `<th class="col-period">Wkt ${escHtml(String(p.id))}<br><span class="time">${escHtml(p.start)}<br>${escHtml(p.end)}</span></th>`;
+    }
+  });
+
+  // ── Data rows ──
+  let tbodyHtml = '';
+  guruList.forEach((g, i) => {
+    tbodyHtml += `<tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">`;
+    tbodyHtml += `<td class="cell-guru">${escHtml(g.name)}</td>`;
+    periods.forEach(p => {
+      if (p.id === 'REHAT') {
+        tbodyHtml += `<td class="cell-rehat"></td>`;
+        return;
+      }
+      const cells = g.slots[p.id] || [];
+      if (!cells.length) {
+        tbodyHtml += `<td class="cell-empty"></td>`;
+        return;
+      }
+      const inner = cells.map(c =>
+        `<div class="cell-subj">${escHtml(c.subject || '—')}</div><div class="cell-cls">${escHtml(c.className)}</div>`
+      ).join('<div class="cell-sep"></div>');
+      tbodyHtml += `<td class="cell-normal">${inner}</td>`;
+    });
+    tbodyHtml += `</tr>`;
+  });
+
+  const schoolName = document.querySelector('.navbar-title')?.textContent?.trim() || 'SK Pendidikan Khas';
+  const activePeriods = periods.filter(p => p.id !== 'REHAT');
+  const guruColPct = 15;
+  const otherPct   = ((100 - guruColPct) / periods.length).toFixed(2);
+  const rehatPct   = (parseFloat(otherPct) * 0.6).toFixed(2);
+
+  const html = `<!DOCTYPE html>
+<html lang="ms">
+<head>
+<meta charset="UTF-8">
+<title>Jadual Induk - ${dateStr ? formatTarikhBM(dateStr) : escHtml(dayName)}</title>
+<style>
+  @page { size: A4 landscape; margin: 10mm 12mm; }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  body{ font-family:'Segoe UI',Arial,sans-serif; font-size:7.5pt; color:#1e2d4a; background:white; }
+
+  /* ── Header ── */
+  .hdr{ display:flex; align-items:flex-end; justify-content:space-between; margin-bottom:7px; padding-bottom:6px; border-bottom:2.5px solid #0f2044; }
+  .hdr-left{}
+  .hdr-school{ font-size:11pt; font-weight:900; color:#0f2044; line-height:1.2; }
+  .hdr-sub{ font-size:6.8pt; color:#6b7c9e; margin-top:3px; }
+  .hdr-right{ text-align:right; }
+  .hdr-date{ font-size:10pt; font-weight:900; color:#0f2044; }
+  .hdr-day{ font-size:7pt; color:#6b7c9e; margin-top:2px; }
+  .hdr-stats{ font-size:6.5pt; color:#6b7c9e; margin-top:4px; }
+
+  /* ── Table ── */
+  table{ width:100%; border-collapse:collapse; table-layout:fixed; }
+  th, td{ border:1px solid #cbd5e1; vertical-align:middle; }
+  th{ background:#0f2044; color:white; text-align:center; padding:5px 3px; font-size:6.8pt; font-weight:800; line-height:1.4; }
+  th.col-guru{ background:#1a3260; text-align:left; padding-left:7px; width:${guruColPct}%; }
+  th.col-rehat{ background:#374151; color:#94a3b8; font-size:6pt; width:${rehatPct}%; }
+  th.col-period{ width:${otherPct}%; }
+  .time{ font-size:5.2pt; color:rgba(255,255,255,.6); font-weight:500; display:block; margin-top:1px; line-height:1.3; }
+
+  tr.row-even td{ background:white; }
+  tr.row-odd  td{ background:#f8faff; }
+  tr.row-even td.cell-guru{ background:#f0f4fa; }
+  tr.row-odd  td.cell-guru{ background:#e8eef8; }
+
+  td.cell-guru{ font-size:6.5pt; font-weight:800; color:#0f2044; padding:4px 7px; line-height:1.35; }
+  td.cell-normal{ padding:3px 4px; text-align:center; }
+  td.cell-empty{ background:#fafbfe !important; }
+  td.cell-rehat{ background:#f1f5f9 !important; }
+
+  .cell-subj{ font-size:6.8pt; font-weight:800; color:#1e3a8a; line-height:1.3; }
+  .cell-cls{ font-size:5.6pt; font-weight:700; color:#334155; opacity:.9; }
+  .cell-sep{ border-top:1px dashed #93c5fd; margin:2px 0; }
+
+  /* ── Footer ── */
+  .footer{ margin-top:6px; display:flex; justify-content:space-between; font-size:6pt; color:#94a3b8; }
+
+  /* Butang print — tidak tercetak */
+  .no-print{ margin-top:18px; text-align:center; padding:16px; }
+  @media print{ .no-print{ display:none !important; } }
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <div class="hdr-left">
+    <div class="hdr-school">Jadual Waktu Guru — ${escHtml(schoolName)}</div>
+    <div class="hdr-sub">Jadual asal mengikut data MasterTime Table</div>
+    <div class="hdr-stats">${guruList.length} orang guru &nbsp;·&nbsp; ${activePeriods.length} waktu pengajaran</div>
+  </div>
+  <div class="hdr-right">
+    <div class="hdr-date">${escHtml(dateStr)}</div>
+    <div class="hdr-day">${escHtml(dayName)}</div>
+  </div>
+</div>
+
+<table>
+  <thead><tr>${thHtml}</tr></thead>
+  <tbody>${tbodyHtml}</tbody>
+</table>
+
+<div class="footer">
+  <span>Jadual ini adalah jadual waktu asal. Tiada kaitan dengan kehadiran atau guru ganti.</span>
+  <span>${escHtml(schoolName)} &nbsp;·&nbsp; ${escHtml(dateStr)}</span>
+</div>
+
+<div class="no-print">
+  <button onclick="window.print()" style="padding:11px 30px;background:#0f2044;color:white;border:none;border-radius:9px;font-size:13px;font-weight:800;cursor:pointer;font-family:sans-serif;margin-right:8px;">
+    🖨️ Print / Simpan sebagai PDF
+  </button>
+  <button onclick="window.close()" style="padding:11px 20px;background:#f0f4fa;color:#0f2044;border:1.5px solid #dde4f0;border-radius:9px;font-size:13px;font-weight:700;cursor:pointer;font-family:sans-serif;">
+    Tutup
+  </button>
+  <div style="margin-top:10px;font-size:11px;color:#6b7c9e;">
+    Tip: Untuk simpan sebagai PDF, pilih <strong>Simpan sebagai PDF</strong> dalam dialog print.<br>
+    Pastikan orientasi ditetapkan kepada <strong>Landscape</strong>.
+  </div>
+</div>
+
+</body>
+</html>`;
+
+  _openPrint(html, 'Jadual Induk - ' + (dateStr ? formatTarikhBM(dateStr) : dayName));
+}
+
+
+/* ═══════════════════════════════════════════════════════════
+   ASSIGN MODAL
+   ═══════════════════════════════════════════════════════════ */
+function openAssignModal(assignKey) {
+  if (!currentBoard) return;
+  const parts    = assignKey.split('|');
+  const teacherId = parts[0], periodId = parts[1], className = parts[2];
+  const cell     = currentBoard.grid?.[className]?.[periodId];
+  if (!cell) return;
+
+  currentAssignSlot = { assignKey, teacherId, periodId, className, cell };
+  assignSortKey = 'free';
+  overrideOpen = false;
+  // Reset override panel
+  document.getElementById('override-list-wrap')?.classList.add('hidden');
+  document.getElementById('override-chevron')?.classList.remove('open');
+
+  // Isi semula nota yang ada (jika ada)
+  const existingVal  = currentBoard.assignments?.[assignKey];
+  const existingNote = getReliefNote(existingVal);
+  const noteEl = document.getElementById('assign-note');
+  if (noteEl) noteEl.value = existingNote;
+
+  // Info slot
+  const period = (currentBoard.periods || []).find(p => p.id === periodId) || {};
+  document.getElementById('assign-slot-info').innerHTML = `
+    <div class="assign-slot-row">
+      <div class="assign-slot-item"><div class="assign-slot-label">Waktu</div><div class="assign-slot-value">Wkt ${periodId}</div></div>
+      <div class="assign-slot-item"><div class="assign-slot-label">Masa</div><div class="assign-slot-value" style="font-size:.78rem;">${period.start || '—'} – ${period.end || '—'}</div></div>
+      <div class="assign-slot-item"><div class="assign-slot-label">Kelas</div><div class="assign-slot-value">${escHtml(className)}</div></div>
+      <div class="assign-slot-item"><div class="assign-slot-label">Subjek</div><div class="assign-slot-value">${escHtml(cell.subject)}</div></div>
+    </div>
+    <div style="margin-top:10px;font-size:.72rem;color:rgba(255,255,255,.65);">Guru asal: <strong style="color:white;">${escHtml(cell.teacherName)}</strong></div>
+    ${cell.reliefTeacher ? `<div style="margin-top:5px;font-size:.72rem;background:rgba(255,255,255,.12);border-radius:6px;padding:4px 8px;color:rgba(255,255,255,.9);">✅ Guru ganti semasa: <strong>${escHtml(cell.reliefTeacher)}</strong>${cell.note ? ` · 📝 <em style="font-weight:500;">${escHtml(cell.note)}</em>` : ''}</div>` : ''}
+  `;
+
+  renderAssignList();
+  document.getElementById('assignModal').classList.remove('hidden');
+  // Reset sort buttons
+  ['free','busy','name'].forEach(k => document.getElementById(`asort-${k}`)?.classList.remove('active'));
+  document.getElementById('asort-free')?.classList.add('active');
+}
+
+function renderAssignList() {
+  if (!currentAssignSlot || !currentBoard) return;
+  const { assignKey, periodId, cell } = currentAssignSlot;
+  const availList = currentBoard.periodAvailMap?.[periodId] || [];
+
+  // Kira siapa yang DAH jadi relief pada waktu ini (dari assignments semasa)
+  const reliefBusySet = new Set();
+  Object.entries(currentBoard.assignments || {}).forEach(([key, val]) => {
+    const reliefName = getReliefName(val);
+    if (!reliefName) return;
+    const kPeriod = key.split('|')[1];
+    if (kPeriod === periodId && key !== assignKey) reliefBusySet.add(reliefName);
+  });
+
+  // Kira relief count hari ini per guru
+  const reliefCountMap = {};
+  Object.values(currentBoard.assignments || {}).forEach(v => {
+    const name = getReliefName(v);
+    if (name) reliefCountMap[name] = (reliefCountMap[name] || 0) + 1;
+  });
+
+  // Available = free & belum jadi relief waktu ini
+  const available = availList.filter(t => !reliefBusySet.has(t.name));
+  const currentRelief = cell.reliefTeacher;
+
+  const sortFn = (a, b) => {
+    if (assignSortKey === 'free') return b.freeSlots - a.freeSlots;
+    if (assignSortKey === 'busy') return a.busyPeriods - b.busyPeriods;
+    return a.name.localeCompare(b.name);
+  };
+  available.sort(sortFn);
+
+  function buildCard(t, isOverride) {
+    const isSelected  = currentRelief === t.name;
+    // FIX v4.3: guna t.reliefCount dari backend (periodAvailMap) sebagai sumber
+    // tunggal — konsisten dengan t.busyPeriods yang kini TIDAK lagi termasuk
+    // waktu relief. reliefCountMap (frontend) dikekalkan sebagai fallback sahaja.
+    const rc          = t.reliefCount ?? (reliefCountMap[t.name] || 0);
+    const isRelieving = reliefBusySet.has(t.name);
+    const isAbsent    = (currentBoard.absentIds || []).includes(t.id);
+
+    let statusNote = '';
+    if (isRelieving) {
+      const dutyEntry = Object.entries(currentBoard.assignments || {}).find(([k,v]) =>
+        getReliefName(v) === t.name && k.split('|')[1] === periodId && k !== assignKey
+      );
+      const dutyClass = dutyEntry ? dutyEntry[0].split('|')[2] : '?';
+      statusNote = `<span class="assign-stat-chip" style="background:#fff7ed;color:#c2410c;">📌 Relief ${dutyClass}</span>`;
+    }
+    if (isAbsent) statusNote = `<span class="assign-stat-chip assign-stat-busy">✗ Tidak Hadir</span>`;
+
+    // ══════════════════════════════════════════════════════════════
+    // FIX v4.2: Dalam OVERRIDE mode, SEMUA guru boleh dipilih
+    // termasuk yang tidak hadir — ini keputusan PK/GPK untuk override.
+    // Dalam senarai AVAILABLE biasa, yang tidak hadir tidak boleh dipilih.
+    // ══════════════════════════════════════════════════════════════
+    const clickable = isOverride ? true : !isAbsent;
+
+    const cardBorder = isOverride ? 'border-color:#ea580c;background:#fff7ed;' : '';
+
+    // Warning badges untuk override
+    const hasBusyClass   = isOverride && !isRelieving && !isAbsent;
+    const overrideWarning = hasBusyClass
+      ? `<span class="assign-stat-chip" style="background:#fff7ed;color:#c2410c;border:1px solid #fed7aa;">⚠️ Ada kelas — beban berganda</span>`
+      : '';
+    const absentOverrideNote = isOverride && isAbsent
+      ? `<span class="assign-stat-chip" style="background:#fef2f2;color:#dc2626;border:1px solid #fecaca;">⚠️ Tidak hadir — override sahaja</span>`
+      : '';
+
+    return `<div class="assign-teacher-card ${isSelected?'selected':''}" style="${cardBorder};${!clickable?'opacity:.55;':''}cursor:${clickable?'pointer':'default'};" onclick="${clickable?'selectTeacher(\"'+escJs(t.name)+'\")':''}">
+      <div style="flex:1;min-width:0;">
+        <div class="assign-teacher-name">${escHtml(t.name)}</div>
+        <div class="assign-teacher-stats">
+          <span class="assign-stat-chip assign-stat-free" title="Waktu kosong (bukan mengajar & bukan relief)"><i class="fas fa-circle" style="font-size:.35rem;"></i> ${t.freeSlots??'—'} bebas</span>
+          <span class="assign-stat-chip assign-stat-busy" title="Waktu mengajar rasmi mengikut jadual (tidak termasuk relief)"><i class="fas fa-circle" style="font-size:.35rem;"></i> ${t.busyPeriods??'—'} mengajar</span>
+          ${rc > 0 ? `<span class="assign-stat-chip assign-stat-relief" title="Jumlah waktu jadi guru ganti hari ini">${rc}× relief</span>` : ''}
+          ${statusNote}
+          ${overrideWarning}
+          ${absentOverrideNote}
+        </div>
+      </div>
+      ${clickable ? `<button class="btn-assign ${isSelected?'selected':''}" onclick="event.stopPropagation();selectTeacher('${escJs(t.name)}')">${isSelected?'<i class="fas fa-check"></i> Dipilih':'<i class="fas fa-hand-pointer"></i> Pilih'}</button>` : ''}
+    </div>`;
+  }
+
+  // ══════════════════════════════════════════════════════════════
+  // FIX v4.2: Senarai available — SEMUA guru bebas untuk waktu ini
+  // (tidak ada had bilangan)
+  // ══════════════════════════════════════════════════════════════
+  document.getElementById('assign-available-list').innerHTML = available.length
+    ? available.map(t => buildCard(t, false)).join('')
+    : `<div style="text-align:center;padding:20px;color:var(--muted);font-size:var(--fs-sm);">Tiada guru tersedia untuk waktu ini.</div>`;
+
+  // ══════════════════════════════════════════════════════════════
+  // FIX v4.2: Override list — SEMUA guru yang tidak dalam available,
+  // pastikan merangkumi SETIAP guru dalam allTeachers tanpa pengecualian.
+  // Semua boleh dipilih (termasuk tidak hadir) dalam override mode.
+  // ══════════════════════════════════════════════════════════════
+  const availIds = new Set(available.map(t => t.id));
+  // Juga masukkan guru yang muncul dalam periodAvailMap (semua period) untuk data lengkap
+  const allPeriodTeacherMap = {};
+  Object.values(currentBoard.periodAvailMap || {}).forEach(list => {
+    list.forEach(t => { allPeriodTeacherMap[t.id] = t; });
+  });
+  const overrideTeachers = allTeachers
+    .filter(t => !availIds.has(t.id))
+    .map(t => {
+      const fromPeriod = allPeriodTeacherMap[t.id];
+      const fromAvail  = (currentBoard.periodAvailMap?.[periodId] || []).find(x => x.id === t.id);
+      return {
+        ...t,
+        busyPeriods: fromAvail?.busyPeriods ?? fromPeriod?.busyPeriods ?? '—',
+        freeSlots:   fromAvail?.freeSlots   ?? fromPeriod?.freeSlots   ?? '—'
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  document.getElementById('assign-override-list').innerHTML = overrideTeachers.length
+    ? overrideTeachers.map(t => buildCard(t, true)).join('')
+    : `<div style="text-align:center;padding:16px;color:var(--muted);font-size:var(--fs-sm);">Tiada guru lain.</div>`;
+}
+
+function setSortAssign(key) {
+  assignSortKey = key;
+  ['free','busy','name'].forEach(k => document.getElementById(`asort-${k}`)?.classList.remove('active'));
+  document.getElementById(`asort-${key}`)?.classList.add('active');
+  renderAssignList();
+}
+
+let overrideOpen = false;
+function toggleOverride() {
+  overrideOpen = !overrideOpen;
+  const wrap    = document.getElementById('override-list-wrap');
+  const chevron = document.getElementById('override-chevron');
+  if (overrideOpen) {
+    wrap.classList.remove('hidden');
+    chevron.classList.add('open');
+  } else {
+    wrap.classList.add('hidden');
+    chevron.classList.remove('open');
+  }
+}
+
+function selectTeacher(teacherName) {
+  if (!currentAssignSlot || !currentBoard) return;
+  const { assignKey, periodId, className, teacherId } = currentAssignSlot;
+  const date = document.getElementById('boardDate').value;
+  const note = document.getElementById('assign-note')?.value?.trim() || '';
+
+  // Update local state — format baru { relief, note }
+  if (!currentBoard.assignments) currentBoard.assignments = {};
+  currentBoard.assignments[assignKey] = { relief: teacherName, note };
+  // Kemaskini grid (untuk PDF & display)
+  if (currentBoard.grid[className]?.[periodId]) {
+    currentBoard.grid[className][periodId].reliefTeacher = teacherName;
+    currentBoard.grid[className][periodId].note = note;
+  }
+  // Kemaskini teacherMap jika ada
+  const tmEntry = currentBoard.teacherMap?.[teacherId];
+  if (tmEntry && tmEntry[periodId]) {
+    tmEntry[periodId].forEach(slot => {
+      if (slot.className === className) { slot.reliefTeacher = teacherName; slot.note = note; }
+    });
+  }
+
+  // Re-render
+  renderTimetable(currentBoard);
+  renderAssignList();
+  closeAssignModal();
+  updateBoardHeader(currentBoard);
+
+  // Save ke server
+  if (!isLocal) {
+    callAPI('updateAssignment', { date, assignKey, reliefTeacher: teacherName, note })
+      .then(res => {
+        if (!res.success) showAlert('Gagal simpan: ' + res.message, 'error');
+        else {
+          // Refresh periodAvailMap dari server
+          applyBoardSilent(res);
+        }
+      })
+      .catch(e => showAlert('Ralat simpan: ' + e.message, 'error'));
+  }
+
+  showAlert(`✅ ${teacherName} dipilih sebagai guru ganti.`, 'success');
+}
+
+function clearAssignment() {
+  if (!currentAssignSlot || !currentBoard) return;
+  const { assignKey, periodId, className } = currentAssignSlot;
+  const date = document.getElementById('boardDate').value;
+
+  if (currentBoard.assignments) delete currentBoard.assignments[assignKey];
+  if (currentBoard.grid[className]?.[periodId]) {
+    currentBoard.grid[className][periodId].reliefTeacher = '';
+    currentBoard.grid[className][periodId].note = '';
+  }
+  // Kemaskini teacherMap jika ada
+  const parts0 = assignKey.split('|');
+  const tid0 = parts0[0], pid0 = parts0[1], cls0 = parts0.slice(2).join('|');
+  const tmEntry0 = currentBoard.teacherMap?.[tid0];
+  if (tmEntry0 && tmEntry0[pid0]) {
+    tmEntry0[pid0].forEach(slot => {
+      if (slot.className === cls0) { slot.reliefTeacher = ''; slot.note = ''; }
+    });
+  }
+  const noteEl = document.getElementById('assign-note');
+  if (noteEl) noteEl.value = '';
+
+  renderTimetable(currentBoard);
+  renderAssignList();
+  closeAssignModal();
+
+  if (!isLocal) {
+    callAPI('updateAssignment', { date, assignKey, reliefTeacher: '', note: '' })
+      .catch(e => showAlert('Ralat: ' + e.message, 'error'));
+  }
+}
+
+/* Simpan catatan sahaja (tanpa tukar guru ganti) */
+function saveNoteOnly() {
+  if (!currentAssignSlot || !currentBoard) return;
+  const { assignKey, periodId, className } = currentAssignSlot;
+  const date      = document.getElementById('boardDate').value;
+  const note      = document.getElementById('assign-note')?.value?.trim() || '';
+  const existing  = currentBoard.assignments?.[assignKey];
+  const reliefTeacher = getReliefName(existing);
+
+  // Kemaskini local state
+  if (!currentBoard.assignments) currentBoard.assignments = {};
+  if (reliefTeacher || note) {
+    currentBoard.assignments[assignKey] = { relief: reliefTeacher, note };
+  } else {
+    delete currentBoard.assignments[assignKey];
+  }
+  if (currentBoard.grid[className]?.[periodId]) {
+    currentBoard.grid[className][periodId].note = note;
+  }
+
+  renderTimetable(currentBoard);
+  closeAssignModal();
+  showAlert('📝 Catatan disimpan.', 'success');
+
+  if (!isLocal) {
+    callAPI('updateAssignment', { date, assignKey, reliefTeacher, note })
+      .then(res => { if (!res.success) showAlert('Gagal simpan catatan: ' + res.message, 'error'); })
+      .catch(e => showAlert('Ralat: ' + e.message, 'error'));
+  }
+}
+
+function closeAssignModal() {
+  document.getElementById('assignModal').classList.add('hidden');
+  currentAssignSlot = null;
+}
+
+// Silent apply — update periodAvailMap sahaja tanpa re-render semua
+function applyBoardSilent(board) {
+  if (!board || !board.success) return;
+  if (board.periodAvailMap) currentBoard.periodAvailMap = board.periodAvailMap;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   CONFIRM BOARD
+   ═══════════════════════════════════════════════════════════ */
+function confirmBoard() {
+  if (!currentBoard) { showAlert('Tiada tapak untuk disahkan.', 'warn'); return; }
+  const date = document.getElementById('boardDate').value;
+
+  let pending = 0;
+  Object.values(currentBoard.grid || {}).forEach(row => {
+    Object.values(row).forEach(cell => {
+      if (cell.isAbsent && !cell.reliefTeacher) pending++;
+    });
+  });
+
+  if (pending > 0) {
+    showConfirm({
+      title: 'Slot Belum Diisi',
+      msg: `Masih ada <strong>${pending} slot</strong> yang belum diisi guru ganti.<br><br>Teruskan untuk sahkan tapak harian ini?`,
+      okLabel: 'Ya, Sahkan',
+      okType: 'warn',
+      icon: 'exclamation-triangle',
+      onOk: () => doConfirmBoard(date)
+    });
+    return;
+  }
+  doConfirmBoard(date);
+}
+
+function doConfirmBoard(date) {
+  const btn = document.getElementById('btn-confirm-board');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menyahkan...';
+
+  if (isLocal) {
+    setTimeout(() => {
+      currentBoard.status = 'confirmed';
+      updateBoardHeader(currentBoard);
+      btn.disabled = false; btn.innerHTML = '<i class="fas fa-check-circle"></i> Sahkan & Simpan';
+      showAlert('✅ Tapak harian telah disahkan!', 'success');
+    }, 800);
+    return;
+  }
+
+  callAPI('confirmDailyBoard', { date })
+    .then(res => {
+      btn.disabled = false; btn.innerHTML = '<i class="fas fa-check-circle"></i> Sahkan & Simpan';
+      if (res.success) {
+        currentBoard.status = 'confirmed';
+        updateBoardHeader(currentBoard);
+        showAlert('✅ ' + res.message, 'success');
+      } else {
+        showAlert('⚠️ ' + res.message, 'error');
+      }
+    })
+    .catch(e => {
+      btn.disabled = false; btn.innerHTML = '<i class="fas fa-check-circle"></i> Sahkan & Simpan';
+      showAlert('Ralat: ' + e.message, 'error');
+    });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   PDF GENERATION (HTML → print-friendly)
+   ═══════════════════════════════════════════════════════════ */
+function generatePDF() {
+  if (!currentBoard) { showAlert('Tiada tapak untuk dijana PDF.', 'warn'); return; }
+
+  const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
+  const btn = document.getElementById('btn-gen-pdf');
+  const origHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menjana...';
+
+  const htmlContent = buildPDFHTML(currentBoard);
+  document.getElementById('pdf-template').innerHTML = htmlContent;
+
+  // FIX: nama fail/tab ikut format "Jadual Guru Ganti - <Tarikh BM>"
+  const docTitle = `Jadual Guru Ganti - ${formatTarikhBM(currentBoard.date)}`;
+
+  // Android / iOS — guna print modal terus (lebih stabil pada mobile)
+  if (isMobile || isLocal) {
+    btn.disabled = false; btn.innerHTML = origHTML;
+    closePdfModal();
+    const fullHtml = _wrapPrintHTML(htmlContent, docTitle);
+    _openPrint(fullHtml, docTitle);
+    return;
+  }
+
+  // Desktop — jana PDF terus dalam browser (client-side, TIADA Drive)
+  document.getElementById('pdfModal').classList.remove('hidden');
+  document.getElementById('pdf-modal-body').innerHTML = `
+    <div class="state-box" style="border-radius:0;border:none;background:#e5e7eb;">
+      <div class="spinner"></div>
+      <div class="state-title">Menjana PDF...</div>
+      <div class="state-sub">Ini mungkin mengambil beberapa saat</div>
+    </div>`;
+  document.getElementById('btn-download-pdf').style.display = 'none';
+
+  _generatePdfBlob(htmlContent, docTitle)
+    .then(blob => {
+      btn.disabled = false; btn.innerHTML = origHTML;
+      window._lastPdfBlob = blob;
+      window._lastPdfFilename = docTitle + '.pdf';
+      _downloadBlob(blob, docTitle + '.pdf');
+      document.getElementById('pdf-modal-body').innerHTML = `
+        <div class="state-box" style="border-radius:0;border:none;background:#e5e7eb;">
+          <div class="state-icon" style="background:#dcfce7;"><i class="fas fa-check" style="color:#059669;"></i></div>
+          <div class="state-title">PDF Berjaya Dijana!</div>
+          <div class="state-sub">Fail PDF sedang dimuat turun...</div>
+        </div>`;
+      document.getElementById('btn-download-pdf').style.display = '';
+    })
+    .catch(e => {
+      btn.disabled = false; btn.innerHTML = origHTML;
+      closePdfModal();
+      const fullHtml = _wrapPrintHTML(htmlContent, docTitle);
+      _openPrint(fullHtml, docTitle);
+      showAlert('Penjanaan PDF automatik gagal, guna print dialog sebagai alternatif.', 'warn');
+      console.error(e);
+    });
+}
+
+function emailJadualGuruGanti() {
+  if (!currentBoard) { showAlert('Tiada tapak untuk dihantar.', 'warn'); return; }
+  const htmlContent = buildPDFHTML(currentBoard);
+  const btn = document.getElementById('btn-email-pdf');
+  sendPDFToAdminEmail(htmlContent, 'Jadual Guru Ganti', currentBoard.date, btn);
+}
+
+/* Bungkus HTML content dalam dokumen print lengkap */
+function _wrapPrintHTML(content, title) {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${title}</title>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Plus Jakarta Sans', Arial, sans-serif; background: white; }
+    @page { size: A4; margin: 15mm; }
+    @media print { body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+  </style>
+</head>
+<body>${content}</body>
+</html>`;
+}
+
+function showPDFPreviewFallback(htmlContent) {
+  // Dikekalkan untuk compatibility — redirect ke _openPrint
+  closePdfModal();
+  const docTitle = `Jadual Guru Ganti - ${formatTarikhBM(currentBoard?.date)}`;
+  const fullHtml = _wrapPrintHTML(htmlContent, docTitle);
+  _openPrint(fullHtml, docTitle);
+}
+
+function buildPDFHTML(board) {
+  const date = board.date;
+  const dayName = board.dayName || '';
+  const d = new Date(date + 'T00:00:00');
+  const months = ['Januari','Februari','Mac','April','Mei','Jun','Julai','Ogos','September','Oktober','November','Disember'];
+  const fullDate = `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
+
+  // Kumpul semua slot yang perlu ganti — guna teacherMap (BUKAN grid).
+  // grid overwrite bila 2 guru kongsi kelas-waktu sama (team-teaching),
+  // jadi cell.isAbsent/teacherName boleh salah rujuk guru LAIN yang tak
+  // tak-hadir, menyebabkan slot tu terus HILANG dari laporan PDF.
+  // teacherMap simpan setiap guru berasingan — tiada overwrite.
+  const absentIds = board.absentIds || [];
+  const absentTeacherGroups = {};
+
+  absentIds.forEach(teacherId => {
+    const tMap = board.teacherMap?.[teacherId];
+    if (!tMap) return;
+    const teacherName = tMap.name || '';
+    Object.keys(tMap).forEach(periodId => {
+      if (periodId === 'name' || periodId === 'id' || periodId === 'REHAT') return;
+      const p = (board.periods || []).find(pp => pp.id === periodId);
+      if (!p) return;
+      (tMap[periodId] || []).forEach(slot => {
+        if (!absentTeacherGroups[teacherName]) absentTeacherGroups[teacherName] = [];
+        absentTeacherGroups[teacherName].push({
+          period: periodId, time: `${p.start} – ${p.end}`,
+          className: slot.className, subject: slot.subject,
+          reliefTeacher: slot.reliefTeacher || '—',
+          note: slot.note || '',
+          reason: slot.absentReason || ''
+        });
+      });
+    });
+  });
+
+  const logoHtml = SCHOOL_LOGO_URL
+    ? `<img src="${SCHOOL_LOGO_URL}" style="width:60px;height:60px;object-fit:contain;border-radius:8px;">`
+    : `<div style="width:60px;height:60px;background:#1e3a8a;border-radius:8px;display:flex;align-items:center;justify-content:center;color:white;font-weight:900;font-size:.8rem;">SK</div>`;
+
+  let teacherTablesHtml = '';
+  Object.entries(absentTeacherGroups).forEach(([teacherName, slots]) => {
+    slots.sort((a,b) => parseInt(a.period) - parseInt(b.period));
+    const reason = slots[0]?.reason || '';
+    const reasonBadge = reason
+      ? `<div style="margin-left:8px;background:rgba(255,255,255,.15);border-radius:6px;padding:3px 8px;font-size:.68rem;font-weight:700;color:white;">${escHtml(reason)}</div>`
+      : '';
+    const rows = slots.map(s => `
+      <tr>
+        <td style="padding:9px 12px;border-bottom:1px solid #f0f4fa;font-weight:700;text-align:center;">${s.period}</td>
+        <td style="padding:9px 12px;border-bottom:1px solid #f0f4fa;font-family:monospace;font-size:.82rem;">${s.time}</td>
+        <td style="padding:9px 12px;border-bottom:1px solid #f0f4fa;font-weight:700;">${s.className}</td>
+        <td style="padding:9px 12px;border-bottom:1px solid #f0f4fa;">${s.subject}</td>
+        <td style="padding:9px 12px;border-bottom:1px solid #f0f4fa;font-weight:800;color:${s.reliefTeacher==='—'?'#dc2626':'#059669'};">${s.reliefTeacher}</td>
+        <td style="padding:9px 12px;border-bottom:1px solid #f0f4fa;font-size:.78rem;color:#6b7c9e;font-style:${s.note?'normal':'italic'};">${s.note || '—'}</td>
+      </tr>`).join('');
+
+    teacherTablesHtml += `
+      <div style="margin-bottom:20px;border-radius:12px;border:2px solid #e2e8f0;overflow:hidden;">
+        <div style="background:linear-gradient(135deg,#1e3a8a,#1e40af);padding:12px 16px;display:flex;align-items:center;gap:12px;">
+          <div style="background:rgba(255,255,255,.15);border-radius:8px;padding:6px 10px;">
+            <div style="font-size:.6rem;color:rgba(255,255,255,.6);font-weight:700;text-transform:uppercase;">Guru Tidak Hadir</div>
+            <div style="font-size:.9rem;font-weight:900;color:white;">${escHtml(teacherName)}</div>
+          </div>
+          <div style="margin-left:auto;background:rgba(255,255,255,.12);border-radius:6px;padding:4px 10px;font-size:.7rem;color:rgba(255,255,255,.8);font-weight:700;">${slots.length} waktu</div>
+          ${reasonBadge}
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:.85rem;">
+          <thead>
+            <tr style="background:#f8faff;">
+              <th style="padding:9px 12px;font-size:.68rem;font-weight:800;color:#6b7c9e;text-transform:uppercase;border-bottom:2px solid #e2e8f0;text-align:center;width:50px;">Wkt</th>
+              <th style="padding:9px 12px;font-size:.68rem;font-weight:800;color:#6b7c9e;text-transform:uppercase;border-bottom:2px solid #e2e8f0;text-align:left;">Masa</th>
+              <th style="padding:9px 12px;font-size:.68rem;font-weight:800;color:#6b7c9e;text-transform:uppercase;border-bottom:2px solid #e2e8f0;text-align:left;">Kelas</th>
+              <th style="padding:9px 12px;font-size:.68rem;font-weight:800;color:#6b7c9e;text-transform:uppercase;border-bottom:2px solid #e2e8f0;text-align:left;">Subjek</th>
+              <th style="padding:9px 12px;font-size:.68rem;font-weight:800;color:#6b7c9e;text-transform:uppercase;border-bottom:2px solid #e2e8f0;text-align:left;">Guru Ganti</th>
+              <th style="padding:9px 12px;font-size:.68rem;font-weight:800;color:#6b7c9e;text-transform:uppercase;border-bottom:2px solid #e2e8f0;text-align:left;">Catatan</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  });
+
+  if (!teacherTablesHtml) {
+    teacherTablesHtml = `<div style="text-align:center;padding:32px;color:#6b7c9e;font-size:.9rem;"><i class="fas fa-check-circle" style="font-size:2rem;color:#059669;display:block;margin-bottom:10px;"></i>Tiada guru tidak hadir hari ini.</div>`;
+  }
+
+  return `
+    <div style="padding:24px 28px;font-family:'Plus Jakarta Sans',sans-serif;color:#1e2d4a;max-width:800px;">
+      <!-- Header -->
+      <div style="display:flex;align-items:center;gap:16px;margin-bottom:20px;padding-bottom:16px;border-bottom:2px solid #e2e8f0;">
+        ${logoHtml}
+        <div style="flex:1;">
+          <div style="font-size:.7rem;font-weight:700;color:#6b7c9e;text-transform:uppercase;letter-spacing:.08em;">SK Pendidikan Khas Kuantan</div>
+          <div style="font-size:1.1rem;font-weight:900;color:#0f2044;margin:2px 0;">Jadual Guru Ganti</div>
+          <div style="font-size:.85rem;font-weight:700;color:#1e40af;">${dayName}, ${fullDate}</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:.65rem;color:#6b7c9e;font-weight:700;text-transform:uppercase;">Status</div>
+          <div style="font-size:.8rem;font-weight:800;color:${board.status==='confirmed'?'#059669':'#d97706'};">${board.status==='confirmed'?'✅ Disahkan':'📝 Draft'}</div>
+          <div style="font-size:.65rem;color:#9ca3af;margin-top:4px;">Dijana: ${new Date().toLocaleString('ms-MY')}</div>
+        </div>
+      </div>
+      <!-- Tables -->
+      ${teacherTablesHtml}
+      <!-- Footer -->
+      <div style="text-align:center;font-size:.65rem;color:#9ca3af;margin-top:16px;padding-top:12px;border-top:1px solid #f0f4fa;">
+        Dijana oleh Sistem Guru Ganti K-SpeEdS · SK Pendidikan Khas Kuantan
+      </div>
+    </div>`;
+}
+
+function downloadPDF() {
+  if (window._lastPdfBlob) {
+    _downloadBlob(window._lastPdfBlob, window._lastPdfFilename || 'Jadual Guru Ganti.pdf');
+    return;
+  }
+  // Fallback (sepatutnya jarang berlaku — blob belum sedia)
+  const content = document.getElementById('pdf-template').innerHTML;
+  if (!content) return;
+  const docTitle = `Jadual Guru Ganti - ${formatTarikhBM(currentBoard?.date)}`;
+  const fullHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>${docTitle}</title>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Plus Jakarta Sans', Arial, sans-serif; background: white; }
+    @page { size: A4; margin: 15mm; }
+    @media print {
+      body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    }
+  </style>
+</head>
+<body>
+  ${content}
+</body>
+</html>`;
+  _openPrint(fullHtml, docTitle);
+}
+
+function closePdfModal() {
+  document.getElementById('pdfModal').classList.add('hidden');
+  document.getElementById('pdf-template').innerHTML = '';
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ARKIB
+   ═══════════════════════════════════════════════════════════ */
+function loadHistory() {
+  const date = document.getElementById('historyDate').value;
+  if (!date) { showAlert('Sila pilih tarikh.', 'warn'); return; }
+
+  const btn = document.querySelector('button[onclick="loadHistory()"]');
+  const origHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Mencari...';
+
+  document.getElementById('history-date-label').textContent = 'Rekod untuk: ' + date;
+  document.getElementById('history-container').innerHTML = `
+    <div class="state-box"><div class="spinner"></div><div class="state-title">Mencari arkib...</div></div>`;
+  document.getElementById('history-content').classList.remove('hidden');
+
+  function restoreBtn() { btn.disabled = false; btn.innerHTML = origHTML; }
+
+  if (isLocal) {
+    setTimeout(() => { restoreBtn(); renderHistory([], date); }, 800);
+  } else {
+    callAPI('getReliefByDate', date)
+      .then(d => { restoreBtn(); renderHistory(d, date); })
+      .catch(e => { restoreBtn(); showAlert('Gagal muatkan arkib: ' + e.message, 'error'); });
+  }
+}
+
+function renderHistory(records, dateStr) {
+  const container = document.getElementById('history-container');
+  if (!records || !records.length) {
+    container.innerHTML = `<div class="state-box">
+      <div class="state-icon"><i class="fas fa-folder-open"></i></div>
+      <div class="state-title">Tiada Rekod Ditemui</div>
+      <div class="state-sub">Tiada jadual ganti disimpan untuk tarikh ini.</div>
+    </div>`;
+    return;
+  }
+
+  // Group by absent teacher
+  const grouped = {};
+  records.forEach(r => {
+    if (!grouped[r.absentTeacher]) grouped[r.absentTeacher] = [];
+    grouped[r.absentTeacher].push(r);
+  });
+
+  container.innerHTML = '';
+  Object.entries(grouped).forEach(([teacher, slots]) => {
+    slots.sort((a,b) => parseInt(a.period) - parseInt(b.period));
+    const reason = slots[0]?.reason || '';
+    const rs = REASON_STYLE[reason] || { bg: 'rgba(255,255,255,.15)', color: 'rgba(255,255,255,.9)' };
+    const reasonHtml = reason
+      ? `<div class="archive-reason-badge" style="display:inline-block;margin-top:4px;padding:2px 8px;border-radius:20px;font-size:.62rem;font-weight:800;background:${rs.bg};color:${rs.color};">${escHtml(reason)}</div>`
+      : '';
+    const rows = slots.map(s => `
+      <tr>
+        <td>${s.period}</td>
+        <td style="font-family:monospace;font-size:.82rem;">${s.time}</td>
+        <td style="font-weight:700;">${s.className}</td>
+        <td>${s.subject}</td>
+        <td style="font-weight:800;color:#059669;">${s.reliefTeacher || '—'}</td>
+      </tr>`).join('');
+
+    const card = document.createElement('div');
+    card.className = 'archive-card fade-in';
+    card.innerHTML = `
+      <div class="archive-card-head">
+        <div>
+          <div style="font-size:.65rem;color:rgba(255,255,255,.55);font-weight:700;text-transform:uppercase;">Guru Tidak Hadir</div>
+          <div style="font-weight:900;font-size:.95rem;">${escHtml(teacher)}</div>
+          ${reasonHtml}
+        </div>
+        <div style="font-size:.7rem;color:rgba(255,255,255,.7);">${dateStr}</div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table class="archive-table">
+          <thead><tr><th>Wkt</th><th>Masa</th><th>Kelas</th><th>Subjek</th><th>Guru Ganti</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+    container.appendChild(card);
+  });
+}
+
+/* Bina HTML arkib untuk tarikh tertentu — dikongsi oleh printArchive()
+   dan emailArchivePDF(). Pulang null jika tiada rekod untuk dipaparkan. */
+function buildArchiveHTML(date) {
+  const container = document.getElementById('history-container');
+  if (!container.querySelector('.archive-card')) return null;
+
+  const fullDate = formatTarikhBM(date);
+
+  const logoHtml = SCHOOL_LOGO_URL
+    ? `<img src="${SCHOOL_LOGO_URL}" style="width:50px;height:50px;object-fit:contain;border-radius:6px;">`
+    : `<div style="width:50px;height:50px;background:#1e3a8a;border-radius:6px;display:flex;align-items:center;justify-content:center;color:white;font-weight:900;font-size:.75rem;">SK</div>`;
+
+  const cardsHtml = Array.from(container.querySelectorAll('.archive-card')).map(card => {
+    const teacher = card.querySelector('.archive-card-head div div:nth-child(2)')?.textContent?.trim() || '';
+    const reasonBadge = card.querySelector('.archive-reason-badge')?.textContent?.trim() || '';
+    const rows    = Array.from(card.querySelectorAll('tbody tr')).map(tr => {
+      const tds = tr.querySelectorAll('td');
+      return `<tr>
+        <td style="padding:8px 10px;border-bottom:1px solid #f0f4fa;text-align:center;font-weight:700;">${tds[0]?.textContent?.trim()||''}</td>
+        <td style="padding:8px 10px;border-bottom:1px solid #f0f4fa;font-size:.78rem;">${tds[1]?.textContent?.trim()||''}</td>
+        <td style="padding:8px 10px;border-bottom:1px solid #f0f4fa;font-weight:700;">${tds[2]?.textContent?.trim()||''}</td>
+        <td style="padding:8px 10px;border-bottom:1px solid #f0f4fa;">${tds[3]?.textContent?.trim()||''}</td>
+        <td style="padding:8px 10px;border-bottom:1px solid #f0f4fa;font-weight:800;color:#059669;">${tds[4]?.textContent?.trim()||'—'}</td>
+      </tr>`;
+    }).join('');
+    return `<div style="margin-bottom:16px;border-radius:10px;border:2px solid #e2e8f0;overflow:hidden;">
+      <div style="background:#0f2044;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;">
+        <div><div style="font-size:.6rem;color:rgba(255,255,255,.5);font-weight:700;text-transform:uppercase;">Guru Tidak Hadir</div>
+        <div style="font-weight:900;font-size:.88rem;color:white;">${teacher}</div>
+        ${reasonBadge ? `<div style="display:inline-block;margin-top:4px;padding:2px 8px;border-radius:20px;font-size:.6rem;font-weight:800;background:rgba(255,255,255,.15);color:white;">${reasonBadge}</div>` : ''}
+        </div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:.82rem;">
+        <thead><tr style="background:#f8faff;">
+          <th style="padding:7px 10px;font-size:.62rem;font-weight:800;color:#6b7c9e;text-transform:uppercase;border-bottom:2px solid #e2e8f0;text-align:center;width:40px;">Wkt</th>
+          <th style="padding:7px 10px;font-size:.62rem;font-weight:800;color:#6b7c9e;text-transform:uppercase;border-bottom:2px solid #e2e8f0;text-align:left;">Masa</th>
+          <th style="padding:7px 10px;font-size:.62rem;font-weight:800;color:#6b7c9e;text-transform:uppercase;border-bottom:2px solid #e2e8f0;text-align:left;">Kelas</th>
+          <th style="padding:7px 10px;font-size:.62rem;font-weight:800;color:#6b7c9e;text-transform:uppercase;border-bottom:2px solid #e2e8f0;text-align:left;">Subjek</th>
+          <th style="padding:7px 10px;font-size:.62rem;font-weight:800;color:#6b7c9e;text-transform:uppercase;border-bottom:2px solid #e2e8f0;text-align:left;">Guru Ganti</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  }).join('');
+
+  return `<div style="padding:20px 24px;font-family:Arial,sans-serif;color:#1e2d4a;max-width:800px;">
+    <div style="display:flex;align-items:center;gap:14px;margin-bottom:16px;padding-bottom:14px;border-bottom:2px solid #e2e8f0;">
+      ${logoHtml}
+      <div style="flex:1;">
+        <div style="font-size:.65rem;font-weight:700;color:#6b7c9e;text-transform:uppercase;">SK Pendidikan Khas Kuantan</div>
+        <div style="font-size:1rem;font-weight:900;color:#0f2044;margin:2px 0;">Rekod Arkib Guru Ganti</div>
+        <div style="font-size:.82rem;font-weight:700;color:#1e40af;">${fullDate}</div>
+      </div>
+      <div style="font-size:.65rem;color:#9ca3af;">Dijana: ${new Date().toLocaleString('ms-MY')}</div>
+    </div>
+    ${cardsHtml}
+    <div style="text-align:center;font-size:.62rem;color:#9ca3af;margin-top:14px;padding-top:10px;border-top:1px solid #f0f4fa;">
+      Dijana oleh Sistem Guru Ganti K-SpeEdS · SK Pendidikan Khas Kuantan
+    </div>
+  </div>`;
+}
+
+function printArchive() {
+  const date = document.getElementById('historyDate').value;
+  const htmlContent = buildArchiveHTML(date);
+  if (!htmlContent) { showAlert('Tiada rekod untuk dicetak.', 'warn'); return; }
+
+  const btn = document.querySelector('button[onclick="printArchive()"]');
+  const origHTML = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menjana...';
+
+  const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
+
+  // Android / iOS — skip server PDF, guna print modal terus
+  if (isMobile || isLocal) {
+    btn.disabled = false; btn.innerHTML = origHTML;
+    openPrintWindow(htmlContent, date);
+    return;
+  }
+
+  // Desktop — jana PDF terus dalam browser (client-side, TIADA Drive)
+  const archiveDocTitle = `Arkib Guru Ganti - ${formatTarikhBM(date)}`;
+  _generatePdfBlob(htmlContent, archiveDocTitle)
+    .then(blob => {
+      btn.disabled = false; btn.innerHTML = origHTML;
+      _downloadBlob(blob, archiveDocTitle + '.pdf');
+      showAlert('✅ PDF arkib berjaya dimuat turun!', 'success');
+    })
+    .catch(e => {
+      btn.disabled = false; btn.innerHTML = origHTML;
+      openPrintWindow(htmlContent, date);
+      showAlert('Penjanaan PDF automatik gagal, guna print dialog sebagai alternatif.', 'warn');
+      console.error(e);
     });
 }
 
