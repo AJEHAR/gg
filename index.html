@@ -1765,7 +1765,10 @@ function renderAssignList() {
 
   function buildCard(t, isOverride) {
     const isSelected  = currentRelief === t.name;
-    const rc          = reliefCountMap[t.name] || 0;
+    // FIX v4.3: guna t.reliefCount dari backend (periodAvailMap) sebagai sumber
+    // tunggal — konsisten dengan t.busyPeriods yang kini TIDAK lagi termasuk
+    // waktu relief. reliefCountMap (frontend) dikekalkan sebagai fallback sahaja.
+    const rc          = t.reliefCount ?? (reliefCountMap[t.name] || 0);
     const isRelieving = reliefBusySet.has(t.name);
     const isAbsent    = (currentBoard.absentIds || []).includes(t.id);
 
@@ -1801,9 +1804,9 @@ function renderAssignList() {
       <div style="flex:1;min-width:0;">
         <div class="assign-teacher-name">${escHtml(t.name)}</div>
         <div class="assign-teacher-stats">
-          <span class="assign-stat-chip assign-stat-free"><i class="fas fa-circle" style="font-size:.35rem;"></i> ${t.freeSlots??'—'} bebas</span>
-          <span class="assign-stat-chip assign-stat-busy"><i class="fas fa-circle" style="font-size:.35rem;"></i> ${t.busyPeriods??'—'} mengajar</span>
-          ${rc > 0 ? `<span class="assign-stat-chip assign-stat-relief">${rc}× relief</span>` : ''}
+          <span class="assign-stat-chip assign-stat-free" title="Waktu kosong (bukan mengajar & bukan relief)"><i class="fas fa-circle" style="font-size:.35rem;"></i> ${t.freeSlots??'—'} bebas</span>
+          <span class="assign-stat-chip assign-stat-busy" title="Waktu mengajar rasmi mengikut jadual (tidak termasuk relief)"><i class="fas fa-circle" style="font-size:.35rem;"></i> ${t.busyPeriods??'—'} mengajar</span>
+          ${rc > 0 ? `<span class="assign-stat-chip assign-stat-relief" title="Jumlah waktu jadi guru ganti hari ini">${rc}× relief</span>` : ''}
           ${statusNote}
           ${overrideWarning}
           ${absentOverrideNote}
